@@ -7,7 +7,7 @@ app = Flask(__name__)
 
 # ===== CONFIG =====
 VERIFY_TOKEN = "12345"
-WHATSAPP_TOKEN = "EAAdLJb4aLuABRL4EN0xBOzUrZCWzDk4iTBpl66Kq78CvsXSQrBMVMzuGh2FCQmhjq2E2gXZC1uraQHOA9OyP6GoUlhfanr5OnESCfANknwz3yxFJq4d0U4yaPN49O9DxjV1a2UZAW0tjSrUTbALmoEE3k14Dwq66iVkgjS2ZBzHfbtgoLZBXhLNCKtQmbJ7GXnZCYjEd8PzJ1mk2sfZAmxR6dFkuMRcridkgAP5dR0fuSZChwYnrTytf1HIZA5PdInCxEhcZBTorgWlrqUTadWqyW3"
+WHATSAPP_TOKEN = "EAAdLJb4aLuABRPlWtIyfFHFElSTGjX5ZB4n5fWwGcIOHbCOX2I2EgjZBLBV63KbncWk0ZA4avwo1EyPJRFCZCxP9YnZC50uJzWwNb9YGzMUUHRnrpn2Sj9cm0o2HrFF7C5v5GpWTWGcidSrIH0qofsJoZCFDdAyEIZCtBMjMvwIk1327fD6lW3FHtLMbZBb1ZCmHLKOQXASt4YOlkhjM4ZA3AsM2yZASZAXt6ZBTJ92dZAUTGa6Nw2KJAFbbw2qHJQvWRo75ZAhzroJdxH1qWAZCA8v8dhHH"
 PHONE_NUMBER_ID = "1103694872823232"
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -177,59 +177,42 @@ def verify():
     return "Error", 403
 
 
-# ===== HANDLE INCOMING MESSAGES (POST) =====
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    raw_data = request.data
-    print("🔥 RAW BODY:", raw_data)
-
     try:
-        data = request.get_json(force=True)
+        data = request.get_json()
+        print("FULL DATA:", data)
 
-        print("🔥 PARSED JSON:", data)
-
-    try:
-        entry = data.get('entry', [])
+        entry = data.get("entry", [])
         if not entry:
-            print("No entry found")
             return "OK", 200
 
-        changes = entry[0].get('changes', [])
-        if not changes:
-            print("No changes found")
+        changes = entry[0].get("changes", [])
+        value = changes[0].get("value", {})
+
+        messages = value.get("messages")
+        if not messages:
             return "OK", 200
 
-        value = changes[0].get('value', {})
+        msg = messages[0]
 
-        if 'messages' not in value:
-            print("❌ No messages field (probably status update)")
+        if msg.get("type") != "text":
             return "OK", 200
 
-        message_data = value['messages'][0]
+        user_msg = msg["text"]["body"]
+        sender = msg["from"]
 
-        if 'text' not in message_data:
-            print("❌ No text in message")
-            return "OK", 200
+        print("USER:", user_msg)
 
-        message = message_data['text']['body']
-        sender = message_data['from']
-
-        print("✅ User message:", message)
-
-        message = message.lower()
-
-        if "menu" in message:
-            reply = "Menu: https://agnikara.netlify.app/#menu"
-        else:
-            reply = "Hello! How can I help you?"
+        # 🔥 USE AI HERE
+        reply = generate_ai_reply(user_msg)
 
         send_message(sender, reply)
 
     except Exception as e:
-        print("🚨 ERROR:", str(e))
+        print("ERROR:", str(e))
 
     return "OK", 200
-
 
 
 # ===== SEND =====

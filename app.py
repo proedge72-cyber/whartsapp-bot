@@ -2,7 +2,7 @@ from flask import Flask, request
 import requests
 import os
 from openai import OpenAI
-
+print("🚀 NEW CODE RUNNING")
 app = Flask(__name__)
 
 # ===== CONFIG =====

@@ -143,7 +143,7 @@ def format_menu():
 def generate_ai_reply(user_message):
     menu_text = format_menu()
 
-prompt = f"""
+    prompt = f"""
 You are a smart restaurant WhatsApp assistant for Agnikara.
 
 Your job:
@@ -175,7 +175,6 @@ Customer: {user_message}
     )
 
     return response.choices[0].message.content
-
 
 # ===== VERIFY =====
 @app.route('/webhook', methods=['GET'])

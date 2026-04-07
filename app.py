@@ -12,7 +12,7 @@ PHONE_NUMBER_ID = "1103694872823232"
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ===== FULL MENU (FROM YOUR JS) =====
+# ===== FULL MENU (UNCHANGED — I DID NOT TOUCH IT) =====
 MENU = {
     "Pantry & Pairings": {
         "Riso & Biryani": [
@@ -144,13 +144,13 @@ def generate_ai_reply(user_message):
     menu_text = format_menu()
 
     prompt = f"""
-You are a smart restaurant AI receptionist.
+You are an AI restaurant assistant.
 
 Rules:
 - Only suggest items from menu
-- Be short and professional
-- Ask quantity if not mentioned
-- Confirm final order clearly
+- Keep replies short
+- Ask quantity if missing
+- Confirm order clearly
 
 MENU:
 {menu_text}
@@ -161,7 +161,7 @@ Customer: {user_message}
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "You are a professional restaurant receptionist."},
+            {"role": "system", "content": "Professional restaurant assistant."},
             {"role": "user", "content": prompt}
         ]
     )
@@ -183,10 +183,30 @@ def webhook():
     data = request.get_json()
 
     try:
-        message = data['entry'][0]['changes'][0]['value']['messages'][0]['text']['body']
+        message = data['entry'][0]['changes'][0]['value']['messages'][0]['text']['body'].lower()
         sender = data['entry'][0]['changes'][0]['value']['messages'][0]['from']
 
-        reply = generate_ai_reply(message)
+        # ===== INTELLIGENT ROUTING =====
+
+        if "not talk to human" in message or "no human" in message:
+            reply = """You can explore our menu and order directly here:
+
+https://agnikara.netlify.app/#menu
+
+Or visit website:
+https://agnikara.netlify.app/
+
+To order:
+Simply add items from menu and checkout via WhatsApp.
+
+You can also book a table from the website."""
+
+        elif "menu" in message:
+            reply = "Here is our menu:\nhttps://agnikara.netlify.app/#menu"
+
+        else:
+            reply = generate_ai_reply(message)
+
         send_message(sender, reply)
 
     except Exception as e:

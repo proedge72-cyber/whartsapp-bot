@@ -95,10 +95,17 @@ def parse_decimal(raw_value: str) -> Decimal:
 
 def detect_order_message(text: str) -> bool:
     lowered = text.lower()
-    return "\u20ac" in text or (
-        "name:" in lowered
-        and "items" in lowered
-        and "total" in lowered
+    return (
+        "\u20ac" in text
+        or (
+            "name:" in lowered
+            and "items" in lowered
+            and ("total" in lowered or "subtotal" in lowered)
+        )
+        or (
+            "new restaurant order request" in lowered
+            and "items:" in lowered
+        )
     )
 
 
@@ -109,12 +116,12 @@ def parse_order_message(text: str) -> Optional[Dict[str, Any]]:
 
     name_match = re.search(r"Name\s*:\s*(.+)", normalized, flags=re.IGNORECASE)
     total_match = re.search(
-        r"Total\s*:\s*[\u20ac\u20b9]?\s*([0-9]+(?:[.,][0-9]{1,2})?)",
+        r"(?:Total|Subtotal)\s*:\s*[\u20ac\u20b9]?\s*([0-9]+(?:[.,][0-9]{1,2})?)",
         normalized,
         flags=re.IGNORECASE,
     )
     item_pattern = re.compile(
-        r"^\s*[*\-\u2022]?\s*(?P<name>.+?)\s*x(?P<qty>\d+)\s*=\s*[\u20ac\u20b9]?\s*(?P<price>[0-9]+(?:[.,][0-9]{1,2})?)\s*$",
+        r"^\s*[*\-\u2022]?\s*(?P<name>.+?)\s*x(?P<qty>\d+)(?:\s*\([\u20ac\u20b9]?[0-9]+(?:[.,][0-9]{1,2})?\s*each\))?\s*=\s*[\u20ac\u20b9]?\s*(?P<price>[0-9]+(?:[.,][0-9]{1,2})?)\s*$",
         flags=re.IGNORECASE,
     )
 

@@ -5,18 +5,17 @@ import os
 
 app = Flask(__name__)
 
-# 🔑 Keys
+# 🔑 CONFIG
 VERIFY_TOKEN = "12345"
 WHATSAPP_TOKEN = "EAAdLJb4aLuABRPlWtIyfFHFElSTGjX5ZB4n5fWwGcIOHbCOX2I2EgjZBLBV63KbncWk0ZA4avwo1EyPJRFCZCxP9YnZC50uJzWwNb9YGzMUUHRnrpn2Sj9cm0o2HrFF7C5v5GpWTWGcidSrIH0qofsJoZCFDdAyEIZCtBMjMvwIk1327fD6lW3FHtLMbZBb1ZCmHLKOQXASt4YOlkhjM4ZA3AsM2yZASZAXt6ZBTJ92dZAUTGa6Nw2KJAFbbw2qHJQvWRo75ZAhzroJdxH1qWAZCA8v8dhHH"
 PHONE_NUMBER_ID = "1103694872823232"
 
-
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# 🧠 Temporary memory (use DB in real system)
+# 🧠 USER STATE MEMORY (use DB in production)
 user_state = {}
 
-# 📤 Send WhatsApp message
+# 📤 SEND MESSAGE
 def send_message(to, message):
     url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
     headers = {
@@ -30,135 +29,130 @@ def send_message(to, message):
     }
     requests.post(url, headers=headers, json=data)
 
+# 🧠 INIT USER
+def init_user(user_id):
+    if user_id not in user_state:
+        user_state[user_id] = {
+            "greeted": False,
+            "intent": None,
+            "waiting_for_order": False,
+            "order_confirmed": False,
+            "order_stage": None  # preparing / served
+        }
 
-# 🧠 AI RESPONSE FUNCTION
-def get_ai_response(user_id, user_message):
+# 🧠 ORDER DETECTION
+def is_order_message(text):
+    return "total" in text.lower() and "€" in text
 
-    state = user_state.get(user_id, {
-        "has_table": None,
-        "order_started": False
-    })
-
-    system_prompt = f"""
-You are a professional restaurant receptionist AI for Agnikara.
-
-STRICT RULES:
-- Never show full menu in chat
-- Always send this link for menu: https://agnikara.netlify.app/#menu
-- Guide user step by step
-- Be short, polite, premium tone
-- If user sends order details, summarize and confirm
-- If user already has table, don't ask to book table
-
-USER STATE:
-has_table = {state['has_table']}
-order_started = {state['order_started']}
-"""
-
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ]
-    )
-
-    return response['choices'][0]['message']['content']
-
-
-# 🔁 WEBHOOK VERIFY
+# 🔁 VERIFY
 @app.route("/webhook", methods=["GET"])
 def verify():
     if request.args.get("hub.verify_token") == VERIFY_TOKEN:
         return request.args.get("hub.challenge")
-    return "Verification failed"
+    return "error"
 
-
-# 📩 WEBHOOK RECEIVE MESSAGE
+# 📩 MAIN WEBHOOK
 @app.route("/webhook", methods=["POST"])
 def webhook():
-
     data = request.get_json()
 
     try:
         message = data['entry'][0]['changes'][0]['value']['messages'][0]
         user_id = message['from']
-        text = message['text']['body'].lower()
+        text = message['text']['body'].strip()
 
-        # 🧠 Initialize user
-        if user_id not in user_state:
-            user_state[user_id] = {
-                "has_table": None,
-                "order_started": False
-            }
+        init_user(user_id)
+        state = user_state[user_id]
 
-        # 🎯 FIRST MESSAGE LOGIC
-        if text in ["hi", "hello", "hey"]:
-            reply = """Welcome to Agnikara 🍽️
+        # 🟢 GREETING (ONLY ONCE)
+        if not state["greeted"]:
+            send_message(user_id, """Welcome to Agnikara 🍽️
 
-How may I assist you today?
+How can I assist you today?
 
-1. View Menu & Order Food  
+1. Order Food  
 2. Book a Table  
-3. Check Reservation  
-
-Reply with 1, 2 or 3."""
-            send_message(user_id, reply)
+3. Check Reservation""")
+            state["greeted"] = True
             return "ok"
 
-        # 🍽️ USER CHOOSES ORDER
+        # 🟡 ORDER FLOW START
         if text == "1":
-            user_state[user_id]["order_started"] = True
+            state["intent"] = "order"
+            state["waiting_for_order"] = True
 
-            reply = """Great choice 😌
+            send_message(user_id, """Perfect 😌
 
-Explore our menu here:
+Explore our menu:
 https://agnikara.netlify.app/#menu
 
-👉 Add items to cart  
-👉 Checkout  
-👉 Send order here for confirmation"""
-            send_message(user_id, reply)
+Add items → Checkout → Send order here.""")
             return "ok"
 
-        # 🪑 USER CHOOSES TABLE
-        if text == "2":
-            user_state[user_id]["has_table"] = True
+        # 🔵 ORDER RECEIVED
+        if is_order_message(text):
+            state["waiting_for_order"] = False
 
-            reply = """Please share:
-
-Name:
-Date:
-Time:
-Guests:"""
-            send_message(user_id, reply)
-            return "ok"
-
-        # 📦 DETECT ORDER MESSAGE (very simple detection)
-        if "total" in text and "items" in text:
-            state = user_state[user_id]
-
-            reply = f"""Thank you 😌
+            send_message(user_id, f"""Nice choice 😏
 
 I’ve received your order.
 
-Would you like to:
-1. Confirm Order ✅
-2. Add More Items ➕
-3. Cancel ❌"""
+What would you like to do?
 
-            send_message(user_id, reply)
+1. Confirm Order  
+2. Add More Items  
+3. Modify Order""")
             return "ok"
 
-        # 🧠 FALLBACK → AI
-        ai_reply = get_ai_response(user_id, text)
-        send_message(user_id, ai_reply)
+        # 🟣 CONFIRM ORDER
+        if text == "1" and state["intent"] == "order":
+            state["order_confirmed"] = True
+            state["order_stage"] = "preparing"
+
+            send_message(user_id, """Perfect. Your order is now being prepared 🍽️
+
+⏳ Estimated time: 15 minutes
+
+I’ll update you shortly.""")
+            return "ok"
+
+        # 🟠 PREPARING UPDATE
+        if state["order_stage"] == "preparing":
+            state["order_stage"] = "served"
+
+            send_message(user_id, """Update 😌
+
+Your order is being prepared in the kitchen.
+
+Almost ready.""")
+            return "ok"
+
+        # 🔴 SERVED
+        if state["order_stage"] == "served":
+            send_message(user_id, """Your order is ready and served 🍽️
+
+Enjoy your meal.
+
+Let me know if you need anything else.""")
+            state["order_stage"] = None
+            return "ok"
+
+        # ➕ ADD MORE
+        if text == "2":
+            send_message(user_id, """Sure 😌
+
+Add more items here:
+https://agnikara.netlify.app/#menu
+
+Send updated order here.""")
+            return "ok"
 
     except Exception as e:
         print("Error:", e)
 
     return "ok"
 
-
+# 🚀 RUN
 if __name__ == "__main__":
-    app.run(port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)

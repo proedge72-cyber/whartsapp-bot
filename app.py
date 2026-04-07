@@ -182,44 +182,52 @@ def verify():
 def webhook():
     data = request.get_json()
 
+    print("🔥 RAW DATA RECEIVED:", data)  # ALWAYS PRINT FIRST
+
     try:
-        print("FULL DATA:", data)  # 🔥 DEBUG EVERYTHING
+        entry = data.get('entry', [])
+        if not entry:
+            print("No entry found")
+            return "OK", 200
 
-        if 'messages' in data['entry'][0]['changes'][0]['value']:
-            message_data = data['entry'][0]['changes'][0]['value']['messages'][0]
+        changes = entry[0].get('changes', [])
+        if not changes:
+            print("No changes found")
+            return "OK", 200
 
-            if 'text' in message_data:
-                message = message_data['text']['body']
-                sender = message_data['from']
+        value = changes[0].get('value', {})
 
-                print("User message:", message)
+        if 'messages' not in value:
+            print("❌ No messages field (probably status update)")
+            return "OK", 200
 
-                message = message.lower()
+        message_data = value['messages'][0]
 
-                # ===== CONTROL LOGIC =====
-                if any(word in message for word in ["menu", "website", "link"]):
-                    reply = """Visit our website:
-https://agnikara.netlify.app/
+        if 'text' not in message_data:
+            print("❌ No text in message")
+            return "OK", 200
 
-Menu:
-https://agnikara.netlify.app/#menu"""
+        message = message_data['text']['body']
+        sender = message_data['from']
 
-                elif "not talk to human" in message:
-                    reply = """Order directly here:
-https://agnikara.netlify.app/#menu"""
+        print("✅ User message:", message)
 
-                else:
-                    reply = generate_ai_reply(message)
+        message = message.lower()
 
-                send_message(sender, reply)
-
+        if "menu" in message:
+            reply = "Menu: https://agnikara.netlify.app/#menu"
         else:
-            print("No message found (status update or other event)")
+            reply = "Hello! How can I help you?"
+
+        send_message(sender, reply)
 
     except Exception as e:
-        print("ERROR:", str(e))
+        print("🚨 ERROR:", str(e))
 
     return "OK", 200
+
+
+
 # ===== SEND =====
 def send_message(to, text):
     url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"

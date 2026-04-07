@@ -183,46 +183,43 @@ def webhook():
     data = request.get_json()
 
     try:
-        message = data['entry'][0]['changes'][0]['value']['messages'][0]['text']['body']
-        sender = data['entry'][0]['changes'][0]['value']['messages'][0]['from']
+        print("FULL DATA:", data)  # 🔥 DEBUG EVERYTHING
 
-        print("User message:", message)
+        if 'messages' in data['entry'][0]['changes'][0]['value']:
+            message_data = data['entry'][0]['changes'][0]['value']['messages'][0]
 
-        message = message.lower()
+            if 'text' in message_data:
+                message = message_data['text']['body']
+                sender = message_data['from']
 
-        # ===== CONTROL LOGIC =====
+                print("User message:", message)
 
-        if any(word in message for word in ["menu", "show menu", "website", "site", "link"]):
-            reply = """Visit our website and explore full menu here:
+                message = message.lower()
+
+                # ===== CONTROL LOGIC =====
+                if any(word in message for word in ["menu", "website", "link"]):
+                    reply = """Visit our website:
 https://agnikara.netlify.app/
 
-Direct menu:
+Menu:
 https://agnikara.netlify.app/#menu"""
 
-        elif "not talk to human" in message or "no human" in message:
-            reply = """You can order directly from our website:
+                elif "not talk to human" in message:
+                    reply = """Order directly here:
+https://agnikara.netlify.app/#menu"""
 
-Menu:
-https://agnikara.netlify.app/#menu
+                else:
+                    reply = generate_ai_reply(message)
 
-Steps:
-1. Open menu
-2. Add items to cart
-3. Checkout via WhatsApp
-
-You can also book a table from the website."""
+                send_message(sender, reply)
 
         else:
-            reply = generate_ai_reply(message)
-
-        # ✅ THIS WAS MISSING
-        send_message(sender, reply)
+            print("No message found (status update or other event)")
 
     except Exception as e:
-        print("Error:", e)
+        print("ERROR:", str(e))
 
     return "OK", 200
-
 # ===== SEND =====
 def send_message(to, text):
     url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"

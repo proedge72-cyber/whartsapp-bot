@@ -11,7 +11,7 @@ WHATSAPP_TOKEN = "EAAdLJb4aLuABRPlWtIyfFHFElSTGjX5ZB4n5fWwGcIOHbCOX2I2EgjZBLBV63
 PHONE_NUMBER_ID = "1103694872823232"
 
 
-openai.api_key = OPENAI_API_KEY
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # 🧠 Temporary memory (use DB in real system)
 user_state = {}

@@ -355,10 +355,22 @@ def update_customer_profile(state: Dict[str, Any], profile_data: Dict[str, str])
         state["order"]["name"] = state["customer_profile"]["name"]
 
 
-def generate_order_summary(order: Dict[str, Any]) -> str:
+def generate_order_summary(order: Dict[str, Any], state: Optional[Dict[str, Any]] = None) -> str:
     name = order.get("name") or "there"
     currency = order.get("currency", DEFAULT_CURRENCY)
-    lines = [f"Here\u2019s your updated order, {name} \U0001f60f", ""]
+    if state is None:
+        intro = f"Here\u2019s your updated order, {name} \U0001f60f"
+    else:
+        intro = choose_variant(
+            state,
+            "order_summary_intro",
+            [
+                f"Here\u2019s your updated order, {name} \U0001f60f",
+                f"This is your updated order, {name} \U0001f60f",
+                f"Your latest order looks like this, {name} \U0001f60f",
+            ],
+        )
+    lines = [intro, ""]
     for item in order.get("items", []):
         lines.append(f"{item['name']} x{item['qty']} \u2014 {money_to_text(item['price'], currency)}")
     lines.extend(
@@ -514,16 +526,67 @@ def greeting_message() -> str:
     )
 
 
-def order_instruction_message() -> str:
+def greeting_message_for_state(state: Dict[str, Any]) -> str:
+    opener = choose_variant(
+        state,
+        "greeting",
+        [
+            "Welcome to Agnikara \U0001f37d\ufe0f",
+            "A warm welcome to Agnikara \U0001f37d\ufe0f",
+            "Good to have you at Agnikara \U0001f37d\ufe0f",
+        ],
+    )
+    assist = choose_variant(
+        state,
+        "greeting_assist",
+        [
+            "How can I assist you today?",
+            "How may I help you today?",
+            "What can I help you with today?",
+        ],
+    )
     return (
-        "Perfect \U0001f60c\n\n"
-        f"Explore our menu:\n{MENU_URL}\n\n"
-        "Add items \u2192 Checkout \u2192 Send your order here."
+        f"{opener}\n\n"
+        f"{assist}\n\n"
+        "1. Order Food\n"
+        "2. Book a Table\n"
+        "3. Check Reservation"
     )
 
 
-def payment_prompt_message() -> str:
-    return "How would you like to pay?\n\n1. Pay Online \U0001f4b3\n2. Pay at Counter"
+def order_instruction_message(state: Dict[str, Any]) -> str:
+    intro = choose_variant(
+        state,
+        "order_instruction_intro",
+        [
+            "Perfect \U0001f60c",
+            "Lovely \U0001f60c",
+            "Absolutely \U0001f60c",
+        ],
+    )
+    closing = choose_variant(
+        state,
+        "order_instruction_closing",
+        [
+            "Add items \u2192 Checkout \u2192 Send your order here.",
+            "Choose your items \u2192 Checkout \u2192 Send the order here.",
+            "Build your order \u2192 Checkout \u2192 Share it here.",
+        ],
+    )
+    return f"{intro}\n\nExplore our menu:\n{MENU_URL}\n\n{closing}"
+
+
+def payment_prompt_message(state: Dict[str, Any]) -> str:
+    intro = choose_variant(
+        state,
+        "payment_prompt",
+        [
+            "How would you like to pay?",
+            "How would you prefer to pay?",
+            "What payment option works best for you?",
+        ],
+    )
+    return f"{intro}\n\n1. Pay Online \U0001f4b3\n2. Pay at Counter"
 
 
 def handoff_message() -> str:
@@ -675,22 +738,22 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
     if action == "show_greeting":
         set_stage(state, STAGE_MAIN_MENU)
         state["failure_count"] = 0
-        return greeting_message()
+        return greeting_message_for_state(state)
     if action == "show_menu_link":
         state["intent"] = "order"
         set_stage(state, STAGE_CHECKOUT)
         state["waiting_for_order"] = True
         state["checkout_mode"] = "fresh"
         state["failure_count"] = 0
-        return order_instruction_message()
+        return order_instruction_message(state)
     if action == "summarize_order" and state["order"]["items"]:
         set_stage(state, STAGE_ORDER_ACTION)
         state["failure_count"] = 0
-        return generate_order_summary(state["order"])
+        return generate_order_summary(state["order"], state)
     if action == "confirm_order" and state["order"]["items"]:
         set_stage(state, STAGE_PAYMENT_CHOICE)
         state["failure_count"] = 0
-        return payment_prompt_message()
+        return payment_prompt_message(state)
     if action == "add_more_items":
         set_stage(state, STAGE_CHECKOUT)
         state["waiting_for_order"] = True
@@ -726,7 +789,7 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
             state["order"] = updated
             set_stage(state, STAGE_ORDER_ACTION)
             state["failure_count"] = 0
-            return generate_order_summary(state["order"])
+            return generate_order_summary(state["order"], state)
         return "I couldn\u2019t match that item. Please use the exact item name from your checkout."
     if action == "update_quantity":
         item_name = (decision.get("item_name") or "").strip().lower()
@@ -738,7 +801,7 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
             state["order"] = updated
             set_stage(state, STAGE_ORDER_ACTION)
             state["failure_count"] = 0
-            return generate_order_summary(state["order"])
+            return generate_order_summary(state["order"], state)
         return "I couldn\u2019t match that item. Please use the exact item name from your checkout."
     if action == "send_payment_link":
         state["payment_method"] = "online"
@@ -899,7 +962,7 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
             state["order"] = updated
             set_stage(state, STAGE_ORDER_ACTION)
             state["failure_count"] = 0
-            return generate_order_summary(state["order"])
+            return generate_order_summary(state["order"], state)
         state["failure_count"] += 1
         return "I couldn\u2019t match that item. Please use the exact item name from your checkout."
     if intent == "order_checkout":
@@ -929,7 +992,7 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         set_stage(state, STAGE_ORDER_ACTION)
         state["failure_count"] = 0
         append_sheet_log(user_id, state, "order_updated")
-        return generate_order_summary(state["order"])
+        return generate_order_summary(state["order"], state)
     if state["stage"] in {STAGE_RESERVATION_DETAILS, STAGE_RESERVATION_CHECK}:
         return handle_reservation_stage(user_id, state, text)
     return None
@@ -944,12 +1007,12 @@ def build_reply(user_id: str, text: str) -> str:
         state["greeted"] = True
         state["stage"] = STAGE_MAIN_MENU
         if text.strip().lower() in {"1", "2", "3"}:
-            initial = greeting_message()
-            follow_up = handle_rule_intent(user_id, state, infer_intent_rule(text, state), text) or greeting_message()
+            initial = greeting_message_for_state(state)
+            follow_up = handle_rule_intent(user_id, state, infer_intent_rule(text, state), text) or greeting_message_for_state(state)
             save_state(user_id, state)
             return f"{initial}\n\n{follow_up}"
         save_state(user_id, state)
-        return greeting_message()
+        return greeting_message_for_state(state)
 
     decision = classify_intent(text, state)
     state["last_ai_action"] = decision.get("action", "")

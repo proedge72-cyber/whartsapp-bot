@@ -57,6 +57,7 @@ def create_default_state() -> Dict[str, Any]:
         "payment_status": "pending",
         "payment_method": "",
         "payment_link": "",
+        "payment_link_id": "",
         "awaiting_payment_choice": False,
         "awaiting_payment_confirmation": False,
         "order_stage": "none",
@@ -277,6 +278,7 @@ def generate_payment_link(user_id: str, state: Dict[str, Any]) -> str:
     if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
         fallback = f"{PUBLIC_BASE_URL.rstrip('/')}/pay/{user_id}" if PUBLIC_BASE_URL else "Payment link unavailable."
         state["payment_link"] = fallback
+        state["payment_link_id"] = ""
         return fallback
 
     order = state["order"]
@@ -303,7 +305,34 @@ def generate_payment_link(user_id: str, state: Dict[str, Any]) -> str:
     response.raise_for_status()
     data = response.json()
     state["payment_link"] = data.get("short_url", "")
+    state["payment_link_id"] = data.get("id", "")
     return state["payment_link"]
+
+
+def verify_online_payment(state: Dict[str, Any]) -> bool:
+    payment_link_id = state.get("payment_link_id", "")
+    if not payment_link_id or not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        return False
+
+    verify_url = f"{RAZORPAY_BASE_URL.rstrip('/')}/{payment_link_id}"
+    response = requests.get(
+        verify_url,
+        auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+        timeout=30,
+    )
+    response.raise_for_status()
+    data = response.json()
+    status = str(data.get("status", "")).lower()
+    payments = data.get("payments") or []
+
+    if status == "paid":
+        return True
+
+    for payment in payments:
+        if str(payment.get("status", "")).lower() == "captured":
+            return True
+
+    return False
 
 
 def append_sheet_log(user_id: str, state: Dict[str, Any], event_type: str) -> None:
@@ -460,11 +489,21 @@ def handle_payment_choice(user_id: str, state: Dict[str, Any], text: str) -> str
         return "Perfect. Payment is marked for counter. Your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
 
     if normalized in {"paid", "yes", "done", "completed"}:
-        state["payment_status"] = "done"
-        state["awaiting_payment_choice"] = False
-        state["awaiting_payment_confirmation"] = False
-        finalize_confirmation(state)
-        return "Payment received. Your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
+        if state.get("payment_method") == "online":
+            try:
+                if verify_online_payment(state):
+                    state["payment_status"] = "done"
+                    state["awaiting_payment_choice"] = False
+                    state["awaiting_payment_confirmation"] = False
+                    finalize_confirmation(state)
+                    return "Payment received. Your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
+            except requests.RequestException as exc:
+                logger.warning("Payment verification failed: %s", exc)
+                return "I couldn’t verify the payment yet. Please wait a moment and reply 'paid' again."
+
+            return "I can’t confirm the payment yet. Please complete the payment link, then reply 'paid'."
+
+        return "Please use the payment option shown above."
 
     return "Please choose 1 or 2 for payment."
 
@@ -552,6 +591,7 @@ def handle_order_flow(user_id: str, state: Dict[str, Any], text: str) -> str:
         state["payment_status"] = "pending"
         state["payment_method"] = ""
         state["payment_link"] = ""
+        state["payment_link_id"] = ""
         state["awaiting_payment_choice"] = False
         state["awaiting_payment_confirmation"] = False
         append_sheet_log(user_id, state, "order_updated")

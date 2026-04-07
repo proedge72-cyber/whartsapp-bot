@@ -73,6 +73,8 @@ SUPPORTED_ACTIONS = {
 
 db_lock = threading.Lock()
 processed_message_ids = set()
+payment_followup_timers: Dict[str, threading.Timer] = {}
+payment_timer_lock = threading.Lock()
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -546,6 +548,7 @@ def generate_final_order_summary(state: Dict[str, Any]) -> str:
     lines = [header, ""]
     if order.get("order_id"):
         lines.append(f"Order ID: {order['order_id']}")
+        lines.append("")
     if profile.get("name"):
         lines.append(f"Name: {profile['name']}")
     if profile.get("mobile"):
@@ -580,8 +583,8 @@ def generate_final_order_summary(state: Dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            f"Total: {money_to_text(order.get('total', Decimal('0.00')), currency)}",
-            f"Payment: {payment_label}",
+            f"Total Amount: {money_to_text(order.get('total', Decimal('0.00')), currency)}",
+            f"Payment Mode: {payment_label}",
             f"Order Status: {state.get('order_stage', 'none').title()}",
         ]
     )
@@ -618,6 +621,63 @@ def generate_tracked_order_summary(record: Dict[str, Any], state: Dict[str, Any]
     return "\n".join(lines)
 
 
+def payment_success_message(state: Dict[str, Any]) -> str:
+    return (
+        "Payment received. Your order is now being prepared \U0001f37d\ufe0f\n\n"
+        "\u23f3 Estimated time: 15 minutes\n\n"
+        f"{generate_final_order_summary(state)}"
+    )
+
+
+def payment_counter_fallback_message(state: Dict[str, Any]) -> str:
+    return (
+        "Payment is not arrived in our gateway, so payment mode is now set to counter.\n\n"
+        "If you already made the payment, please share your payment slip at the counter.\n\n"
+        "Thanks for your order.\n\n"
+        f"{generate_final_order_summary(state)}"
+    )
+
+
+def schedule_payment_followup(user_id: str, order_id: str) -> None:
+    if not order_id:
+        return
+    cancel_payment_followup(user_id, order_id)
+
+    def _run() -> None:
+        key = payment_timer_key(user_id, order_id)
+        try:
+            state = get_state(user_id)
+            if state.get("active_order_id") != order_id:
+                return
+            if state.get("payment_method") != "online" or state.get("payment_status") == "done":
+                return
+            state["payment_pending_since"] = state.get("payment_pending_since") or utc_now() - timedelta(seconds=60)
+            try:
+                if verify_online_payment(state):
+                    finalize_confirmation(state)
+                    save_state(user_id, state)
+                    send_whatsapp_message(user_id, payment_success_message(state), max_words=220)
+                    return
+            except requests.RequestException as exc:
+                logger.warning("Scheduled payment verification failed: %s", exc)
+                return
+
+            state["payment_method"] = "counter"
+            state["payment_status"] = "done"
+            finalize_confirmation(state)
+            save_state(user_id, state)
+            send_whatsapp_message(user_id, payment_counter_fallback_message(state), max_words=220)
+        finally:
+            with payment_timer_lock:
+                payment_followup_timers.pop(key, None)
+
+    timer = threading.Timer(60.0, _run)
+    timer.daemon = True
+    with payment_timer_lock:
+        payment_followup_timers[payment_timer_key(user_id, order_id)] = timer
+    timer.start()
+
+
 def truncate_response(text: str, max_words: int = 80) -> str:
     words = text.split()
     if len(words) <= max_words:
@@ -625,7 +685,7 @@ def truncate_response(text: str, max_words: int = 80) -> str:
     return " ".join(words[:max_words]).strip() + "..."
 
 
-def send_whatsapp_message(to: str, body: str) -> None:
+def send_whatsapp_message(to: str, body: str, max_words: int = 80) -> None:
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         logger.warning("WhatsApp credentials missing. Skipping send to %s.", to)
         return
@@ -638,7 +698,7 @@ def send_whatsapp_message(to: str, body: str) -> None:
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
-        "text": {"preview_url": True, "body": truncate_response(body)},
+        "text": {"preview_url": True, "body": truncate_response(body, max_words=max_words)},
     }
     response = requests.post(url, headers=headers, json=payload, timeout=30)
     logger.info("WhatsApp send response %s: %s", response.status_code, response.text)
@@ -730,6 +790,20 @@ def should_ignore_duplicate(message_id: str) -> bool:
         processed_message_ids.clear()
         processed_message_ids.add(message_id)
     return False
+
+
+def payment_timer_key(user_id: str, order_id: str) -> str:
+    return f"{user_id}:{order_id}"
+
+
+def cancel_payment_followup(user_id: str, order_id: str) -> None:
+    if not order_id:
+        return
+    key = payment_timer_key(user_id, order_id)
+    with payment_timer_lock:
+        timer = payment_followup_timers.pop(key, None)
+    if timer:
+        timer.cancel()
 
 
 def set_stage(state: Dict[str, Any], stage: str) -> None:
@@ -1079,17 +1153,14 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
         try:
             if verify_online_payment(state):
                 finalize_confirmation(state)
-                return (
-                    "Payment received. Your order is now being prepared \U0001f37d\ufe0f\n\n"
-                    "\u23f3 Estimated time: 15 minutes\n\n"
-                    f"{generate_final_order_summary(state)}"
-                )
+                return payment_success_message(state)
         except requests.RequestException as exc:
             logger.warning("Payment verification failed: %s", exc)
         pending_since = state.get("payment_pending_since")
         now = utc_now()
         if not pending_since:
             state["payment_pending_since"] = now
+            schedule_payment_followup(user_id, state.get("active_order_id", ""))
             return choose_variant(
                 state,
                 "payment_wait_60",
@@ -1113,15 +1184,12 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
         state["payment_method"] = "counter"
         state["payment_status"] = "done"
         finalize_confirmation(state)
-        return (
-            "Payment is not arrived in our gateway, so payment mode is now set to counter.\n\n"
-            "If you already made the payment, please share your payment slip at the counter.\n\n"
-            "Thanks for your order.\n\n"
-            f"{generate_final_order_summary(state)}"
-        )
+        cancel_payment_followup(user_id, state.get("active_order_id", ""))
+        return payment_counter_fallback_message(state)
     if action == "pay_at_counter":
         state["payment_method"] = "counter"
         state["failure_count"] = 0
+        cancel_payment_followup(user_id, state.get("active_order_id", ""))
         finalize_confirmation(state)
         return (
             "Perfect. Payment is marked for counter. Your order is now being prepared \U0001f37d\ufe0f\n\n"
@@ -1253,6 +1321,7 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         now = utc_now()
         if not pending_since:
             state["payment_pending_since"] = now
+            schedule_payment_followup(user_id, state.get("active_order_id", ""))
             return choose_variant(
                 state,
                 "payment_claim_wait_60",
@@ -1276,12 +1345,8 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         state["payment_method"] = "counter"
         state["payment_status"] = "done"
         finalize_confirmation(state)
-        return (
-            "Payment is not arrived in our gateway, so payment mode is now set to counter.\n\n"
-            "If you already make the payment, please share your payment slip at the counter.\n\n"
-            "Thanks for your order.\n\n"
-            f"{generate_final_order_summary(state)}"
-        )
+        cancel_payment_followup(user_id, state.get("active_order_id", ""))
+        return payment_counter_fallback_message(state)
     if intent == "payment_pending":
         return "No problem. Complete the payment when you’re ready, then reply 'paid'."
     if intent == "cancel_handoff":
@@ -1415,7 +1480,8 @@ def receive_webhook() -> Tuple[str, int]:
 
     try:
         reply = build_reply(sender, text)
-        send_whatsapp_message(sender, reply)
+        max_words = 220 if "Order ID:" in reply or "Total Amount:" in reply or "Total:" in reply else 80
+        send_whatsapp_message(sender, reply, max_words=max_words)
         append_sheet_log(sender, get_state(sender), "message_handled")
     except requests.RequestException as exc:
         logger.exception("External API error: %s", exc)

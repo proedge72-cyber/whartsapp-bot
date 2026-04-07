@@ -2,10 +2,12 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import threading
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -22,6 +24,7 @@ MENU_URL = "https://agnikara.netlify.app/#menu"
 DEFAULT_CURRENCY = os.getenv("CURRENCY_SYMBOL", "EUR")
 WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v20.0")
 ORDER_PREP_MINUTES = int(os.getenv("ORDER_PREP_MINUTES", "15"))
+DB_PATH = Path(os.getenv("STATE_DB_PATH", "agnikara_state.db"))
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
@@ -33,19 +36,90 @@ RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
 RAZORPAY_BASE_URL = os.getenv("RAZORPAY_BASE_URL", "https://api.razorpay.com/v1/payment_links")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 SHEET_WEBHOOK_URL = os.getenv("SHEET_WEBHOOK_URL", "")
+HUMAN_HANDOFF_CONTACT = os.getenv("HUMAN_HANDOFF_CONTACT", "")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
-user_states: Dict[str, Dict[str, Any]] = {}
+STAGE_MAIN_MENU = "awaiting_main_choice"
+STAGE_CHECKOUT = "awaiting_checkout"
+STAGE_ORDER_ACTION = "awaiting_order_action"
+STAGE_PAYMENT_CHOICE = "awaiting_payment_choice"
+STAGE_PAYMENT_CONFIRMATION = "awaiting_payment_confirmation"
+STAGE_PREPARING = "preparing"
+STAGE_SERVED = "served"
+STAGE_RESERVATION_DETAILS = "reservation_pending_details"
+STAGE_RESERVATION_CHECK = "reservation_check_pending"
+STAGE_HUMAN_HANDOFF = "human_handoff"
+
+SUPPORTED_ACTIONS = {
+    "none",
+    "show_greeting",
+    "show_menu_link",
+    "summarize_order",
+    "confirm_order",
+    "add_more_items",
+    "modify_order",
+    "remove_item",
+    "update_quantity",
+    "send_payment_link",
+    "check_payment_status",
+    "pay_at_counter",
+    "check_order_stage",
+    "book_table",
+    "check_reservation",
+    "handoff_to_human",
+}
+
+db_lock = threading.Lock()
 processed_message_ids = set()
-state_lock = threading.Lock()
+
+
+def get_db_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(DB_PATH, check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+db = get_db_connection()
+
+
+def initialize_db() -> None:
+    with db_lock:
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_states (
+                user_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reservations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        db.commit()
+
+
+initialize_db()
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def create_default_state() -> Dict[str, Any]:
     return {
         "greeted": False,
         "intent": "none",
+        "stage": STAGE_MAIN_MENU,
         "waiting_for_order": False,
         "order": {
             "name": "",
@@ -53,27 +127,81 @@ def create_default_state() -> Dict[str, Any]:
             "total": Decimal("0.00"),
             "currency": DEFAULT_CURRENCY,
         },
+        "customer_profile": {
+            "name": "",
+            "mobile": "",
+            "email": "",
+            "service_type": "",
+            "preferred_time": "",
+            "guests": "",
+        },
         "order_confirmed": False,
         "payment_status": "pending",
         "payment_method": "",
         "payment_link": "",
         "payment_link_id": "",
-        "awaiting_payment_choice": False,
-        "awaiting_payment_confirmation": False,
+        "payment_verification_attempts": 0,
         "order_stage": "none",
         "reservation_status": "none",
-        "processed_messages": [],
+        "reservation_details": {},
+        "handoff_requested": False,
+        "failure_count": 0,
+        "last_ai_action": "",
         "last_message_at": None,
         "confirmed_at": None,
         "stage_updated_at": None,
     }
 
 
+def serialize_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    safe = deepcopy(state)
+    safe["order"]["total"] = str(safe["order"]["total"])
+    for item in safe["order"]["items"]:
+        item["price"] = str(item["price"])
+    for key in ("last_message_at", "confirmed_at", "stage_updated_at"):
+        if safe.get(key):
+            safe[key] = safe[key].isoformat()
+    return safe
+
+
+def deserialize_state(state_json: str) -> Dict[str, Any]:
+    state = json.loads(state_json)
+    state["order"]["total"] = Decimal(state["order"].get("total", "0.00"))
+    for item in state["order"]["items"]:
+        item["price"] = Decimal(item.get("price", "0.00"))
+    for key in ("last_message_at", "confirmed_at", "stage_updated_at"):
+        if state.get(key):
+            state[key] = datetime.fromisoformat(state[key])
+    return state
+
+
+def save_state(user_id: str, state: Dict[str, Any]) -> None:
+    payload = json.dumps(serialize_state(state))
+    with db_lock:
+        db.execute(
+            """
+            INSERT INTO user_states (user_id, state_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                state_json = excluded.state_json,
+                updated_at = excluded.updated_at
+            """,
+            (user_id, payload, utc_now().isoformat()),
+        )
+        db.commit()
+
+
 def get_state(user_id: str) -> Dict[str, Any]:
-    with state_lock:
-        if user_id not in user_states:
-            user_states[user_id] = create_default_state()
-        return user_states[user_id]
+    with db_lock:
+        row = db.execute(
+            "SELECT state_json FROM user_states WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    if not row:
+        state = create_default_state()
+        save_state(user_id, state)
+        return state
+    return deserialize_state(row["state_json"])
 
 
 def normalize_text(text: str) -> str:
@@ -100,15 +228,8 @@ def detect_order_message(text: str) -> bool:
     lowered = text.lower()
     return (
         "\u20ac" in text
-        or (
-            "name:" in lowered
-            and "items" in lowered
-            and ("total" in lowered or "subtotal" in lowered)
-        )
-        or (
-            "new restaurant order request" in lowered
-            and "items:" in lowered
-        )
+        or ("name:" in lowered and "items" in lowered and ("total" in lowered or "subtotal" in lowered))
+        or ("new restaurant order request" in lowered and "items:" in lowered)
     )
 
 
@@ -117,7 +238,14 @@ def parse_order_message(text: str) -> Optional[Dict[str, Any]]:
     if not normalized:
         return None
 
-    name_match = re.search(r"Name\s*:\s*(.+)", normalized, flags=re.IGNORECASE)
+    fields = {
+        "name": re.search(r"Name\s*:\s*(.+)", normalized, flags=re.IGNORECASE),
+        "mobile": re.search(r"Mobile\s*:\s*(.+)", normalized, flags=re.IGNORECASE),
+        "email": re.search(r"Email\s*:\s*(.+)", normalized, flags=re.IGNORECASE),
+        "service_type": re.search(r"Service Type\s*:\s*(.+)", normalized, flags=re.IGNORECASE),
+        "preferred_time": re.search(r"Preferred Time\s*:\s*(.+)", normalized, flags=re.IGNORECASE),
+        "guests": re.search(r"Guests\s*:\s*(.+)", normalized, flags=re.IGNORECASE),
+    }
     total_match = re.search(
         r"(?:Total|Subtotal)\s*:\s*[\u20ac\u20b9]?\s*([0-9]+(?:[.,][0-9]{1,2})?)",
         normalized,
@@ -133,14 +261,11 @@ def parse_order_message(text: str) -> Optional[Dict[str, Any]]:
         match = item_pattern.match(line.strip())
         if not match:
             continue
-        item_name = match.group("name").strip()
-        qty = int(match.group("qty"))
-        line_price = parse_decimal(match.group("price"))
         items.append(
             {
-                "name": item_name,
-                "qty": qty,
-                "price": line_price,
+                "name": match.group("name").strip(),
+                "qty": int(match.group("qty")),
+                "price": parse_decimal(match.group("price")),
             }
         )
 
@@ -150,84 +275,89 @@ def parse_order_message(text: str) -> Optional[Dict[str, Any]]:
     currency = "EUR" if "\u20ac" in normalized else DEFAULT_CURRENCY
     derived_total = sum((item["price"] for item in items), Decimal("0.00"))
     parsed_total = parse_decimal(total_match.group(1)) if total_match else derived_total
+    name_value = fields["name"].group(1).strip() if fields["name"] else ""
 
     return {
-        "name": name_match.group(1).strip() if name_match else "",
+        "name": name_value,
         "items": items,
         "total": parsed_total if parsed_total > 0 else derived_total,
         "currency": currency,
+        "profile": {
+            "name": name_value,
+            "mobile": fields["mobile"].group(1).strip() if fields["mobile"] else "",
+            "email": fields["email"].group(1).strip() if fields["email"] else "",
+            "service_type": fields["service_type"].group(1).strip() if fields["service_type"] else "",
+            "preferred_time": fields["preferred_time"].group(1).strip() if fields["preferred_time"] else "",
+            "guests": fields["guests"].group(1).strip() if fields["guests"] else "",
+        },
     }
 
 
 def merge_orders(existing_order: Dict[str, Any], incoming_order: Dict[str, Any]) -> Dict[str, Any]:
     merged = deepcopy(existing_order)
     item_index = {item["name"].lower(): item for item in merged["items"]}
-
     if incoming_order.get("name"):
         merged["name"] = incoming_order["name"]
     if incoming_order.get("currency"):
         merged["currency"] = incoming_order["currency"]
-
     for new_item in incoming_order.get("items", []):
         key = new_item["name"].lower()
         if key in item_index:
             item_index[key]["qty"] += new_item["qty"]
             item_index[key]["price"] += new_item["price"]
         else:
-            fresh_item = {
+            fresh = {
                 "name": new_item["name"],
                 "qty": new_item["qty"],
                 "price": new_item["price"],
             }
-            merged["items"].append(fresh_item)
-            item_index[key] = fresh_item
-
+            merged["items"].append(fresh)
+            item_index[key] = fresh
     merged["total"] = sum((item["price"] for item in merged["items"]), Decimal("0.00"))
     return merged
 
 
 def modify_order_from_text(order: Dict[str, Any], text: str) -> Tuple[Dict[str, Any], bool]:
-    updated_order = deepcopy(order)
+    updated = deepcopy(order)
     lowered = text.lower()
-
     remove_match = re.search(r"remove\s+(.+)", lowered)
     if remove_match:
         target = remove_match.group(1).strip()
-        original_count = len(updated_order["items"])
-        updated_order["items"] = [
-            item for item in updated_order["items"] if item["name"].lower() != target
-        ]
-        updated_order["total"] = sum((item["price"] for item in updated_order["items"]), Decimal("0.00"))
-        return updated_order, len(updated_order["items"]) != original_count
+        original_count = len(updated["items"])
+        updated["items"] = [item for item in updated["items"] if item["name"].lower() != target]
+        updated["total"] = sum((item["price"] for item in updated["items"]), Decimal("0.00"))
+        return updated, len(updated["items"]) != original_count
 
     qty_match = re.search(r"(?:change|update|set)\s+(.+?)\s+to\s+(\d+)", lowered)
     if not qty_match:
-        return updated_order, False
+        return updated, False
 
     target = qty_match.group(1).strip()
     new_qty = int(qty_match.group(2))
-
-    for item in updated_order["items"]:
+    for item in updated["items"]:
         if item["name"].lower() == target:
             unit_price = item["price"] / item["qty"] if item["qty"] else item["price"]
             item["qty"] = new_qty
             item["price"] = unit_price * new_qty
-            updated_order["total"] = sum((line["price"] for line in updated_order["items"]), Decimal("0.00"))
-            return updated_order, True
+            updated["total"] = sum((line["price"] for line in updated["items"]), Decimal("0.00"))
+            return updated, True
+    return updated, False
 
-    return updated_order, False
+
+def update_customer_profile(state: Dict[str, Any], profile_data: Dict[str, str]) -> None:
+    for key, value in profile_data.items():
+        if value:
+            state["customer_profile"][key] = value
+    if state["customer_profile"].get("name") and not state["order"]["name"]:
+        state["order"]["name"] = state["customer_profile"]["name"]
 
 
 def generate_order_summary(order: Dict[str, Any]) -> str:
     name = order.get("name") or "there"
     currency = order.get("currency", DEFAULT_CURRENCY)
     lines = [f"Here\u2019s your updated order, {name} \U0001f60f", ""]
-
     for item in order.get("items", []):
-        lines.append(
-            f"{item['name']} x{item['qty']} \u2014 {money_to_text(item['price'], currency)}"
-        )
-
+        lines.append(f"{item['name']} x{item['qty']} \u2014 {money_to_text(item['price'], currency)}")
     lines.extend(
         [
             "",
@@ -253,7 +383,6 @@ def send_whatsapp_message(to: str, body: str) -> None:
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         logger.warning("WhatsApp credentials missing. Skipping send to %s.", to)
         return
-
     url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
@@ -265,16 +394,29 @@ def send_whatsapp_message(to: str, body: str) -> None:
         "type": "text",
         "text": {"preview_url": True, "body": truncate_response(body)},
     }
-
     response = requests.post(url, headers=headers, json=payload, timeout=30)
     logger.info("WhatsApp send response %s: %s", response.status_code, response.text)
     response.raise_for_status()
 
 
+def append_sheet_log(user_id: str, state: Dict[str, Any], event_type: str) -> None:
+    if not SHEET_WEBHOOK_URL:
+        return
+    payload = {
+        "user_id": user_id,
+        "event_type": event_type,
+        "state": serialize_state(state),
+        "timestamp": utc_now().isoformat(),
+    }
+    try:
+        requests.post(SHEET_WEBHOOK_URL, json=payload, timeout=15)
+    except requests.RequestException as exc:
+        logger.warning("Sheet webhook failed: %s", exc)
+
+
 def generate_payment_link(user_id: str, state: Dict[str, Any]) -> str:
     if state["payment_link"]:
         return state["payment_link"]
-
     if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
         fallback = f"{PUBLIC_BASE_URL.rstrip('/')}/pay/{user_id}" if PUBLIC_BASE_URL else "Payment link unavailable."
         state["payment_link"] = fallback
@@ -288,14 +430,11 @@ def generate_payment_link(user_id: str, state: Dict[str, Any]) -> str:
         "currency": order.get("currency", DEFAULT_CURRENCY),
         "accept_partial": False,
         "description": f"Agnikara order for {order.get('name') or user_id}",
-        "customer": {
-            "name": order.get("name") or "Guest",
-        },
+        "customer": {"name": order.get("name") or "Guest"},
         "notify": {"sms": False, "email": False},
-        "reference_id": f"agnikara-{user_id}-{int(datetime.now(timezone.utc).timestamp())}",
+        "reference_id": f"agnikara-{user_id}-{int(utc_now().timestamp())}",
         "callback_method": "get",
     }
-
     response = requests.post(
         RAZORPAY_BASE_URL,
         auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
@@ -313,7 +452,6 @@ def verify_online_payment(state: Dict[str, Any]) -> bool:
     payment_link_id = state.get("payment_link_id", "")
     if not payment_link_id or not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
         return False
-
     verify_url = f"{RAZORPAY_BASE_URL.rstrip('/')}/{payment_link_id}"
     response = requests.get(
         verify_url,
@@ -324,120 +462,28 @@ def verify_online_payment(state: Dict[str, Any]) -> bool:
     data = response.json()
     status = str(data.get("status", "")).lower()
     payments = data.get("payments") or []
-
     if status == "paid":
         return True
-
-    for payment in payments:
-        if str(payment.get("status", "")).lower() == "captured":
-            return True
-
-    return False
+    return any(str(payment.get("status", "")).lower() == "captured" for payment in payments)
 
 
-def append_sheet_log(user_id: str, state: Dict[str, Any], event_type: str) -> None:
-    if not SHEET_WEBHOOK_URL:
-        return
-
-    payload = {
-        "user_id": user_id,
-        "event_type": event_type,
-        "state": serialize_state(state),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    try:
-        requests.post(SHEET_WEBHOOK_URL, json=payload, timeout=15)
-    except requests.RequestException as exc:
-        logger.warning("Sheet webhook failed: %s", exc)
-
-
-def serialize_state(state: Dict[str, Any]) -> Dict[str, Any]:
-    safe = deepcopy(state)
-    safe["order"]["total"] = str(safe["order"]["total"])
-    for item in safe["order"]["items"]:
-        item["price"] = str(item["price"])
-    for key in ("last_message_at", "confirmed_at", "stage_updated_at"):
-        if safe.get(key):
-            safe[key] = safe[key].isoformat()
-    return safe
+def save_reservation_record(user_id: str, details: Dict[str, Any]) -> None:
+    with db_lock:
+        db.execute(
+            "INSERT INTO reservations (user_id, payload_json, created_at) VALUES (?, ?, ?)",
+            (user_id, json.dumps(details), utc_now().isoformat()),
+        )
+        db.commit()
 
 
 def should_ignore_duplicate(message_id: str) -> bool:
-    with state_lock:
-        if message_id in processed_message_ids:
-            return True
+    if message_id in processed_message_ids:
+        return True
+    processed_message_ids.add(message_id)
+    if len(processed_message_ids) > 10000:
+        processed_message_ids.clear()
         processed_message_ids.add(message_id)
-        if len(processed_message_ids) > 10000:
-            processed_message_ids.clear()
-            processed_message_ids.add(message_id)
-        return False
-
-
-def classify_intent_with_ai(user_message: str) -> str:
-    if not openai_client:
-        return "none"
-
-    try:
-        response = openai_client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Classify the restaurant message into exactly one word: "
-                        "order, reservation, reservation_check, payment, status, none."
-                    ),
-                },
-                {"role": "user", "content": user_message},
-            ],
-            max_output_tokens=10,
-        )
-        label = response.output_text.strip().lower()
-        return label if label in {"order", "reservation", "reservation_check", "payment", "status", "none"} else "none"
-    except Exception as exc:
-        logger.warning("OpenAI intent classification failed: %s", exc)
-        return "none"
-
-
-def generate_ai_reply(user_message: str, state: Dict[str, Any]) -> Optional[str]:
-    if not openai_client:
-        return None
-
-    system_prompt = (
-        "You are Agnikara Restaurant AI, a premium WhatsApp receptionist. "
-        "Keep replies under 60 words. Never show the full menu in chat. "
-        f"Always use this menu link when menu is relevant: {MENU_URL}. "
-        "Be calm, structured, and concise. Do not invent menu items or reservation details."
-    )
-
-    state_snapshot = json.dumps(serialize_state(state))
-
-    try:
-        response = openai_client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "system", "content": f"User state: {state_snapshot}"},
-                {"role": "user", "content": user_message},
-            ],
-            max_output_tokens=120,
-        )
-        return truncate_response(response.output_text.strip(), max_words=60)
-    except Exception as exc:
-        logger.warning("OpenAI reply generation failed: %s", exc)
-        return None
-
-
-def refresh_order_stage(state: Dict[str, Any]) -> None:
-    confirmed_at = state.get("confirmed_at")
-    if not confirmed_at or state["order_stage"] == "served":
-        return
-
-    elapsed = datetime.now(timezone.utc) - confirmed_at
-    if elapsed >= timedelta(minutes=ORDER_PREP_MINUTES):
-        state["order_stage"] = "served"
-    elif elapsed >= timedelta(minutes=1):
-        state["order_stage"] = "preparing"
+    return False
 
 
 def greeting_message() -> str:
@@ -459,193 +505,332 @@ def order_instruction_message() -> str:
 
 
 def payment_prompt_message() -> str:
-    return (
-        "How would you like to pay?\n\n"
-        "1. Pay Online \U0001f4b3\n"
-        "2. Pay at Counter"
-    )
+    return "How would you like to pay?\n\n1. Pay Online \U0001f4b3\n2. Pay at Counter"
 
 
-def handle_payment_choice(user_id: str, state: Dict[str, Any], text: str) -> str:
-    normalized = text.strip().lower()
-    if normalized in {"1", "pay online", "online", "online payment"}:
-        link = generate_payment_link(user_id, state)
-        state["payment_method"] = "online"
-        state["payment_status"] = "pending"
-        state["awaiting_payment_choice"] = False
-        state["awaiting_payment_confirmation"] = True
-        if link == "Payment link unavailable.":
-            state["awaiting_payment_confirmation"] = False
-            state["awaiting_payment_choice"] = True
-            return "Online payment is unavailable right now. Please choose 1 or 2."
-        return f"Your secure payment link is ready \U0001f4b3\n{link}\n\nReply 'paid' or 'yes' once done."
-
-    if normalized in {"2", "pay at counter", "counter"}:
-        state["payment_method"] = "counter"
-        state["payment_status"] = "done"
-        state["awaiting_payment_choice"] = False
-        state["awaiting_payment_confirmation"] = False
-        finalize_confirmation(state)
-        return "Perfect. Payment is marked for counter. Your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
-
-    if normalized in {"paid", "yes", "done", "completed"}:
-        if state.get("payment_method") == "online":
-            try:
-                if verify_online_payment(state):
-                    state["payment_status"] = "done"
-                    state["awaiting_payment_choice"] = False
-                    state["awaiting_payment_confirmation"] = False
-                    finalize_confirmation(state)
-                    return "Payment received. Your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
-            except requests.RequestException as exc:
-                logger.warning("Payment verification failed: %s", exc)
-                return "I couldn’t verify the payment yet. Please wait a moment and reply 'paid' again."
-
-            return "I can’t confirm the payment yet. Please complete the payment link, then reply 'paid'."
-
-        return "Please use the payment option shown above."
-
-    return "Please choose 1 or 2 for payment."
+def handoff_message() -> str:
+    if HUMAN_HANDOFF_CONTACT:
+        return f"I’m connecting you with our team now. Please also reach us at {HUMAN_HANDOFF_CONTACT}."
+    return "I’m connecting you with our team now. A human teammate will take over shortly."
 
 
-def finalize_confirmation(state: Dict[str, Any]) -> None:
-    state["order_confirmed"] = True
-    state["order_stage"] = "preparing"
-    state["awaiting_payment_choice"] = False
-    state["awaiting_payment_confirmation"] = False
-    now = datetime.now(timezone.utc)
-    state["confirmed_at"] = now
-    state["stage_updated_at"] = now
-    state["waiting_for_order"] = False
+def refresh_order_stage(state: Dict[str, Any]) -> None:
+    confirmed_at = state.get("confirmed_at")
+    if not confirmed_at or state["order_stage"] == "served":
+        return
+    elapsed = utc_now() - confirmed_at
+    if elapsed >= timedelta(minutes=ORDER_PREP_MINUTES):
+        state["order_stage"] = "served"
+        state["stage"] = STAGE_SERVED
+    elif elapsed >= timedelta(minutes=1):
+        state["order_stage"] = "preparing"
+        state["stage"] = STAGE_PREPARING
 
 
-def handle_status_request(state: Dict[str, Any]) -> str:
+def check_order_stage_message(state: Dict[str, Any]) -> str:
     refresh_order_stage(state)
     if state["order_stage"] == "none":
-        return "I don\u2019t have an active order yet. Send your order after checkout and I\u2019ll take it from there."
+        return "I don\u2019t have an active order yet. Send your checkout here and I\u2019ll take it from there."
     if state["order_stage"] == "preparing":
         return "Update \U0001f60c\n\nYour order is currently being prepared in the kitchen."
     return "Your order is ready and has been served \U0001f37d\ufe0f\n\nEnjoy your meal."
 
 
-def handle_reservation_flow(state: Dict[str, Any], text: str) -> str:
-    state["intent"] = "reservation"
+def infer_intent_rule(text: str, state: Dict[str, Any]) -> str:
     lowered = text.lower().strip()
+    if detect_order_message(text):
+        return "order_checkout"
+    if lowered in {"1", "order", "order food"} and state["stage"] == STAGE_MAIN_MENU:
+        return "order_start"
+    if lowered in {"2", "book a table", "table", "reservation"} and state["stage"] == STAGE_MAIN_MENU:
+        return "reservation"
+    if lowered in {"3", "check reservation", "reservation check"} and state["stage"] == STAGE_MAIN_MENU:
+        return "reservation_check"
+    if lowered in {"1", "confirm order", "confirm"} and state["stage"] == STAGE_ORDER_ACTION:
+        return "confirm_order"
+    if lowered in {"2", "add more items"} and state["stage"] == STAGE_ORDER_ACTION:
+        return "add_more_items"
+    if lowered in {"3", "modify order", "modify"} and state["stage"] == STAGE_ORDER_ACTION:
+        return "modify_order"
+    if lowered in {"1", "pay online", "online", "online payment"} and state["stage"] == STAGE_PAYMENT_CHOICE:
+        return "pay_online"
+    if lowered in {"2", "pay at counter", "counter"} and state["stage"] == STAGE_PAYMENT_CHOICE:
+        return "pay_at_counter"
+    if lowered in {"paid", "yes", "done", "completed"} and state["stage"] == STAGE_PAYMENT_CONFIRMATION:
+        return "payment_confirmation"
+    if lowered in {"no", "not paid", "not yet"} and state["stage"] == STAGE_PAYMENT_CONFIRMATION:
+        return "payment_pending"
+    if lowered in {"status", "track order", "where is my order", "preparing", "served"}:
+        return "order_status"
+    if lowered.startswith(("remove ", "change ", "update ", "set ")):
+        return "modify_inline"
+    if any(phrase in lowered for phrase in {"human", "manager", "staff", "call me", "agent"}):
+        return "handoff_to_human"
+    return "none"
 
-    if lowered in {"2", "book a table", "table", "reservation"}:
-        state["reservation_status"] = "pending_details"
-        return "Please share your name, date, time, and guest count."
 
-    if lowered in {"3", "check reservation", "reservation check"}:
-        state["reservation_status"] = "checking"
-        return "Please share your reservation name and date. I\u2019ll help you check it."
+def json_from_text(text: str) -> Optional[Dict[str, Any]]:
+    text = text.strip()
+    if not text:
+        return None
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    candidate = match.group(0) if match else text
+    try:
+        data = json.loads(candidate)
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        return None
 
-    ai_reply = generate_ai_reply(text, state)
-    return ai_reply or "Please share your reservation details and I\u2019ll help you next."
+
+def ai_decide_action(user_message: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    if not openai_client:
+        return {"action": "none", "intent": "none"}
+    system_prompt = (
+        "You are Agnikara Restaurant AI. Return only valid JSON. "
+        "Choose one action from this set: "
+        + ", ".join(sorted(SUPPORTED_ACTIONS))
+        + ". Keep replies under 60 words. Never show the full menu in chat. "
+        f"If menu is relevant, use this link: {MENU_URL}. "
+        "Never claim payment is received unless the action is check_payment_status. "
+        'Schema: {"intent":"string","action":"string","reply":"string","item_name":"string","quantity":0,"needs_handoff":false}.'
+    )
+    try:
+        response = openai_client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": f"State: {json.dumps(serialize_state(state))}"},
+                {"role": "user", "content": user_message},
+            ],
+            max_output_tokens=180,
+        )
+        parsed = json_from_text(response.output_text) or {"action": "none", "intent": "none"}
+        if parsed.get("action") not in SUPPORTED_ACTIONS:
+            parsed["action"] = "none"
+        return parsed
+    except Exception as exc:
+        logger.warning("OpenAI structured decision failed: %s", exc)
+        return {"action": "none", "intent": "none"}
 
 
-def handle_order_flow(user_id: str, state: Dict[str, Any], text: str) -> str:
-    lowered = text.lower().strip()
-    refresh_order_stage(state)
+def classify_intent(text: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    rule_intent = infer_intent_rule(text, state)
+    if rule_intent != "none":
+        return {"intent": rule_intent, "action": "none"}
+    return ai_decide_action(text, state)
 
-    if state["awaiting_payment_choice"]:
-        return handle_payment_choice(user_id, state, lowered)
-    if state["awaiting_payment_confirmation"]:
-        return handle_payment_choice(user_id, state, lowered)
 
-    if lowered == "1" and not state["order"]["items"]:
+def mark_handoff(state: Dict[str, Any]) -> str:
+    state["handoff_requested"] = True
+    state["stage"] = STAGE_HUMAN_HANDOFF
+    return handoff_message()
+
+
+def finalize_confirmation(state: Dict[str, Any]) -> None:
+    now = utc_now()
+    state["order_confirmed"] = True
+    state["payment_status"] = "done"
+    state["stage"] = STAGE_PREPARING
+    state["order_stage"] = "preparing"
+    state["confirmed_at"] = now
+    state["stage_updated_at"] = now
+    state["waiting_for_order"] = False
+
+
+def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any], user_text: str) -> str:
+    action = decision.get("action", "none")
+    lowered = user_text.lower().strip()
+
+    if decision.get("needs_handoff"):
+        return mark_handoff(state)
+    if action == "show_greeting":
+        state["stage"] = STAGE_MAIN_MENU
+        return greeting_message()
+    if action == "show_menu_link":
         state["intent"] = "order"
+        state["stage"] = STAGE_CHECKOUT
         state["waiting_for_order"] = True
         return order_instruction_message()
-
-    if lowered in {"2", "add more items"}:
-        state["intent"] = "order"
+    if action == "summarize_order" and state["order"]["items"]:
+        state["stage"] = STAGE_ORDER_ACTION
+        return generate_order_summary(state["order"])
+    if action == "confirm_order" and state["order"]["items"]:
+        state["stage"] = STAGE_PAYMENT_CHOICE
+        return payment_prompt_message()
+    if action == "add_more_items":
+        state["stage"] = STAGE_CHECKOUT
         state["waiting_for_order"] = True
         return f"Of course.\n\nPlease add more items from {MENU_URL} and send the updated checkout here."
-
-    if lowered in {"3", "modify order", "modify"}:
-        state["intent"] = "order"
+    if action == "modify_order":
+        state["stage"] = STAGE_ORDER_ACTION
         return "Tell me the change in one line. Example: remove pasta alfredo or change margherita pizza to 1."
-
-    if lowered in {"1", "confirm order", "confirm"} and state["order"]["items"] and not state["order_confirmed"]:
-        state["awaiting_payment_choice"] = True
-        state["awaiting_payment_confirmation"] = False
-        return payment_prompt_message()
-
-    if lowered.startswith(("remove ", "change ", "update ", "set ")):
-        updated_order, changed = modify_order_from_text(state["order"], text)
+    if action == "remove_item":
+        item_name = (decision.get("item_name") or "").strip().lower()
+        if not item_name:
+            return "Tell me which item you want removed."
+        updated, changed = modify_order_from_text(state["order"], f"remove {item_name}")
         if changed:
-            state["order"] = updated_order
+            state["order"] = updated
+            state["stage"] = STAGE_ORDER_ACTION
             return generate_order_summary(state["order"])
         return "I couldn\u2019t match that item. Please use the exact item name from your checkout."
+    if action == "update_quantity":
+        item_name = (decision.get("item_name") or "").strip().lower()
+        quantity = int(decision.get("quantity") or 0)
+        if not item_name or quantity <= 0:
+            return "Please tell me the exact item and quantity."
+        updated, changed = modify_order_from_text(state["order"], f"change {item_name} to {quantity}")
+        if changed:
+            state["order"] = updated
+            state["stage"] = STAGE_ORDER_ACTION
+            return generate_order_summary(state["order"])
+        return "I couldn\u2019t match that item. Please use the exact item name from your checkout."
+    if action == "send_payment_link":
+        state["payment_method"] = "online"
+        state["payment_status"] = "pending"
+        state["stage"] = STAGE_PAYMENT_CONFIRMATION
+        link = generate_payment_link(user_id, state)
+        if link == "Payment link unavailable.":
+            state["stage"] = STAGE_PAYMENT_CHOICE
+            return "Online payment is unavailable right now. Please choose 1 or 2."
+        return f"Your secure payment link is ready \U0001f4b3\n{link}\n\nReply 'paid' or 'yes' once done."
+    if action == "check_payment_status":
+        state["payment_verification_attempts"] += 1
+        if state.get("payment_method") != "online":
+            return "Please use the payment option shown above."
+        try:
+            if verify_online_payment(state):
+                finalize_confirmation(state)
+                return "Payment received. Your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
+        except requests.RequestException as exc:
+            logger.warning("Payment verification failed: %s", exc)
+            if state["payment_verification_attempts"] >= 3:
+                return mark_handoff(state)
+            return "I couldn\u2019t verify the payment yet. Please wait a moment and reply 'paid' again."
+        return "I can\u2019t confirm the payment yet. Please complete the payment link, then reply 'paid'."
+    if action == "pay_at_counter":
+        state["payment_method"] = "counter"
+        finalize_confirmation(state)
+        return "Perfect. Payment is marked for counter. Your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
+    if action == "check_order_stage":
+        return check_order_stage_message(state)
+    if action == "book_table":
+        state["intent"] = "reservation"
+        state["stage"] = STAGE_RESERVATION_DETAILS
+        return "Please share your name, date, time, and guest count."
+    if action == "check_reservation":
+        state["intent"] = "reservation"
+        state["stage"] = STAGE_RESERVATION_CHECK
+        return "Please share your reservation name and date. I\u2019ll help you check it."
+    if action == "handoff_to_human":
+        return mark_handoff(state)
+    if state["stage"] == STAGE_HUMAN_HANDOFF:
+        return handoff_message()
+    if state["stage"] in {STAGE_PREPARING, STAGE_SERVED}:
+        return check_order_stage_message(state)
+    if lowered in {"hello", "hi", "hey"} and not state["order"]["items"]:
+        state["stage"] = STAGE_MAIN_MENU
+        return "Please reply with 1 to order food, 2 to book a table, or 3 to check a reservation."
+    state["failure_count"] += 1
+    if state["failure_count"] >= 3:
+        return mark_handoff(state)
+    return decision.get("reply") or "Please reply with 1, 2, or 3, or send your checkout here."
 
-    if detect_order_message(text):
-        parsed_order = parse_order_message(text)
-        if not parsed_order:
+
+def handle_reservation_stage(user_id: str, state: Dict[str, Any], text: str) -> str:
+    if state["stage"] == STAGE_RESERVATION_DETAILS:
+        state["reservation_status"] = "requested"
+        state["reservation_details"] = {"message": text, "type": "new"}
+        save_reservation_record(user_id, state["reservation_details"])
+        return "Thank you. Your table request has been noted. Our team will confirm it shortly."
+    if state["stage"] == STAGE_RESERVATION_CHECK:
+        state["reservation_status"] = "checking"
+        state["reservation_details"] = {"message": text, "type": "check"}
+        return "I’ve noted your reservation details. Our team will verify and update you shortly."
+    return "Please share your reservation details and I’ll help you next."
+
+
+def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: str) -> Optional[str]:
+    if intent == "none":
+        return None
+    if intent == "handoff_to_human":
+        return mark_handoff(state)
+    if intent == "order_start":
+        return execute_action(user_id, state, {"action": "show_menu_link"}, text)
+    if intent == "reservation":
+        return execute_action(user_id, state, {"action": "book_table"}, text)
+    if intent == "reservation_check":
+        return execute_action(user_id, state, {"action": "check_reservation"}, text)
+    if intent == "order_status":
+        return execute_action(user_id, state, {"action": "check_order_stage"}, text)
+    if intent == "confirm_order":
+        return execute_action(user_id, state, {"action": "confirm_order"}, text)
+    if intent == "add_more_items":
+        return execute_action(user_id, state, {"action": "add_more_items"}, text)
+    if intent == "modify_order":
+        return execute_action(user_id, state, {"action": "modify_order"}, text)
+    if intent == "pay_online":
+        return execute_action(user_id, state, {"action": "send_payment_link"}, text)
+    if intent == "pay_at_counter":
+        return execute_action(user_id, state, {"action": "pay_at_counter"}, text)
+    if intent == "payment_confirmation":
+        return execute_action(user_id, state, {"action": "check_payment_status"}, text)
+    if intent == "payment_pending":
+        return "No problem. Complete the payment when you’re ready, then reply 'paid'."
+    if intent == "modify_inline":
+        updated, changed = modify_order_from_text(state["order"], text)
+        if changed:
+            state["order"] = updated
+            state["stage"] = STAGE_ORDER_ACTION
+            return generate_order_summary(state["order"])
+        state["failure_count"] += 1
+        return "I couldn\u2019t match that item. Please use the exact item name from your checkout."
+    if intent == "order_checkout":
+        parsed = parse_order_message(text)
+        if not parsed:
+            state["failure_count"] += 1
             return "I couldn\u2019t read that order clearly. Please resend it in the checkout format with name, items, and total."
-
         state["intent"] = "order"
         state["waiting_for_order"] = False
-        state["order"] = merge_orders(state["order"], parsed_order)
+        state["order"] = merge_orders(state["order"], parsed)
+        update_customer_profile(state, parsed.get("profile", {}))
         state["order_confirmed"] = False
         state["payment_status"] = "pending"
         state["payment_method"] = ""
         state["payment_link"] = ""
         state["payment_link_id"] = ""
-        state["awaiting_payment_choice"] = False
-        state["awaiting_payment_confirmation"] = False
+        state["payment_verification_attempts"] = 0
+        state["stage"] = STAGE_ORDER_ACTION
         append_sheet_log(user_id, state, "order_updated")
         return generate_order_summary(state["order"])
-
-    if lowered in {"status", "track order", "where is my order", "preparing", "served"}:
-        return handle_status_request(state)
-
-    if state["order_confirmed"]:
-        return handle_status_request(state)
-
-    ai_reply = generate_ai_reply(text, state)
-    return ai_reply or "If you\u2019d like to order, use the menu link, checkout, and send the order here."
-
-
-def infer_intent(text: str) -> str:
-    lowered = text.lower().strip()
-    if lowered in {"1", "order", "order food"} or detect_order_message(text):
-        return "order"
-    if lowered in {"2", "book a table", "table", "reservation"}:
-        return "reservation"
-    if lowered in {"3", "check reservation", "reservation check"}:
-        return "reservation_check"
-    if lowered in {"status", "track order", "where is my order", "preparing", "served"}:
-        return "status"
-    return classify_intent_with_ai(text)
+    if state["stage"] in {STAGE_RESERVATION_DETAILS, STAGE_RESERVATION_CHECK}:
+        return handle_reservation_stage(user_id, state, text)
+    return None
 
 
 def build_reply(user_id: str, text: str) -> str:
     state = get_state(user_id)
-    state["last_message_at"] = datetime.now(timezone.utc)
+    state["last_message_at"] = utc_now()
+    refresh_order_stage(state)
 
     if not state["greeted"]:
         state["greeted"] = True
-        stripped = text.strip()
-        if stripped.lower() in {"1", "2", "3"}:
+        state["stage"] = STAGE_MAIN_MENU
+        if text.strip().lower() in {"1", "2", "3"}:
             initial = greeting_message()
-            follow_up = route_message_by_intent(user_id, stripped, state_override=state)
+            follow_up = handle_rule_intent(user_id, state, infer_intent_rule(text, state), text) or greeting_message()
+            save_state(user_id, state)
             return f"{initial}\n\n{follow_up}"
+        save_state(user_id, state)
         return greeting_message()
 
-    return route_message_by_intent(user_id, text)
-
-
-def route_message_by_intent(user_id: str, text: str, state_override: Optional[Dict[str, Any]] = None) -> str:
-    state = state_override or get_state(user_id)
-    intent = infer_intent(text)
-    if intent in {"order", "payment", "status"} or state["intent"] == "order" or state["order"]["items"]:
-        return handle_order_flow(user_id, state, text)
-    if intent in {"reservation", "reservation_check"}:
-        return handle_reservation_flow(state, text)
-
-    ai_reply = generate_ai_reply(text, state)
-    return ai_reply or "Please reply with 1 to order food, 2 to book a table, or 3 to check a reservation."
+    decision = classify_intent(text, state)
+    state["last_ai_action"] = decision.get("action", "")
+    reply = handle_rule_intent(user_id, state, decision.get("intent", "none"), text)
+    if reply is None:
+        reply = execute_action(user_id, state, decision, text)
+    save_state(user_id, state)
+    return reply
 
 
 def extract_message_payload(payload: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
@@ -656,7 +841,6 @@ def extract_message_payload(payload: Dict[str, Any]) -> Optional[Tuple[str, str,
         messages = value.get("messages", [])
         if not messages:
             return None
-
         message = messages[0]
         message_id = message.get("id", "")
         sender = message.get("from", "")
@@ -669,7 +853,7 @@ def extract_message_payload(payload: Dict[str, Any]) -> Optional[Tuple[str, str,
 
 
 @app.get("/")
-def healthcheck() -> Tuple[Dict[str, str], int]:
+def healthcheck() -> Tuple[Any, int]:
     return jsonify({"status": "ok", "service": "Agnikara Restaurant AI"}), 200
 
 
@@ -678,7 +862,6 @@ def verify_webhook() -> Tuple[str, int]:
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
-
     if mode == "subscribe" and token == VERIFY_TOKEN:
         return challenge or "", 200
     return "Verification failed", 403
@@ -688,7 +871,6 @@ def verify_webhook() -> Tuple[str, int]:
 def receive_webhook() -> Tuple[str, int]:
     payload = request.get_json(silent=True) or {}
     logger.info("Incoming payload: %s", payload)
-
     extracted = extract_message_payload(payload)
     if not extracted:
         return "EVENT_RECEIVED", 200

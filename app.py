@@ -120,7 +120,9 @@ def create_default_state() -> Dict[str, Any]:
         "greeted": False,
         "intent": "none",
         "stage": STAGE_MAIN_MENU,
+        "previous_stage": STAGE_MAIN_MENU,
         "waiting_for_order": False,
+        "checkout_mode": "fresh",
         "order": {
             "name": "",
             "items": [],
@@ -147,6 +149,7 @@ def create_default_state() -> Dict[str, Any]:
         "handoff_requested": False,
         "failure_count": 0,
         "last_ai_action": "",
+        "response_counters": {},
         "last_message_at": None,
         "confirmed_at": None,
         "stage_updated_at": None,
@@ -486,6 +489,21 @@ def should_ignore_duplicate(message_id: str) -> bool:
     return False
 
 
+def set_stage(state: Dict[str, Any], stage: str) -> None:
+    current = state.get("stage", STAGE_MAIN_MENU)
+    if current != stage:
+        state["previous_stage"] = current
+        state["stage"] = stage
+        state["stage_updated_at"] = utc_now()
+
+
+def choose_variant(state: Dict[str, Any], key: str, options: List[str]) -> str:
+    counters = state.setdefault("response_counters", {})
+    index = counters.get(key, 0) % len(options)
+    counters[key] = counters.get(key, 0) + 1
+    return options[index]
+
+
 def greeting_message() -> str:
     return (
         "Welcome to Agnikara \U0001f37d\ufe0f\n\n"
@@ -510,8 +528,8 @@ def payment_prompt_message() -> str:
 
 def handoff_message() -> str:
     if HUMAN_HANDOFF_CONTACT:
-        return f"I’m connecting you with our team now. Please also reach us at {HUMAN_HANDOFF_CONTACT}."
-    return "I’m connecting you with our team now. A human teammate will take over shortly."
+        return f"I’m bringing in our team for backup. You can also reach us at {HUMAN_HANDOFF_CONTACT}."
+    return "I’m bringing in a teammate for backup. They’ll review this with priority."
 
 
 def refresh_order_stage(state: Dict[str, Any]) -> None:
@@ -558,6 +576,11 @@ def infer_intent_rule(text: str, state: Dict[str, Any]) -> str:
         return "pay_at_counter"
     if lowered in {"paid", "yes", "done", "completed"} and state["stage"] == STAGE_PAYMENT_CONFIRMATION:
         return "payment_confirmation"
+    if state["stage"] == STAGE_PAYMENT_CONFIRMATION and any(
+        phrase in lowered
+        for phrase in {"already paid", "already make", "already made", "i paid", "i have paid", "payment done"}
+    ):
+        return "payment_claim"
     if lowered in {"no", "not paid", "not yet"} and state["stage"] == STAGE_PAYMENT_CONFIRMATION:
         return "payment_pending"
     if lowered in {"status", "track order", "where is my order", "preparing", "served"}:
@@ -566,6 +589,11 @@ def infer_intent_rule(text: str, state: Dict[str, Any]) -> str:
         return "modify_inline"
     if any(phrase in lowered for phrase in {"human", "manager", "staff", "call me", "agent"}):
         return "handoff_to_human"
+    if state["stage"] == STAGE_HUMAN_HANDOFF and any(
+        phrase in lowered
+        for phrase in {"dont want human", "don't want human", "talk to you", "not human", "stay with you"}
+    ):
+        return "cancel_handoff"
     return "none"
 
 
@@ -622,7 +650,7 @@ def classify_intent(text: str, state: Dict[str, Any]) -> Dict[str, Any]:
 
 def mark_handoff(state: Dict[str, Any]) -> str:
     state["handoff_requested"] = True
-    state["stage"] = STAGE_HUMAN_HANDOFF
+    set_stage(state, STAGE_HUMAN_HANDOFF)
     return handoff_message()
 
 
@@ -630,11 +658,12 @@ def finalize_confirmation(state: Dict[str, Any]) -> None:
     now = utc_now()
     state["order_confirmed"] = True
     state["payment_status"] = "done"
-    state["stage"] = STAGE_PREPARING
+    set_stage(state, STAGE_PREPARING)
     state["order_stage"] = "preparing"
     state["confirmed_at"] = now
     state["stage_updated_at"] = now
     state["waiting_for_order"] = False
+    state["failure_count"] = 0
 
 
 def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any], user_text: str) -> str:
@@ -644,26 +673,50 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
     if decision.get("needs_handoff"):
         return mark_handoff(state)
     if action == "show_greeting":
-        state["stage"] = STAGE_MAIN_MENU
+        set_stage(state, STAGE_MAIN_MENU)
+        state["failure_count"] = 0
         return greeting_message()
     if action == "show_menu_link":
         state["intent"] = "order"
-        state["stage"] = STAGE_CHECKOUT
+        set_stage(state, STAGE_CHECKOUT)
         state["waiting_for_order"] = True
+        state["checkout_mode"] = "fresh"
+        state["failure_count"] = 0
         return order_instruction_message()
     if action == "summarize_order" and state["order"]["items"]:
-        state["stage"] = STAGE_ORDER_ACTION
+        set_stage(state, STAGE_ORDER_ACTION)
+        state["failure_count"] = 0
         return generate_order_summary(state["order"])
     if action == "confirm_order" and state["order"]["items"]:
-        state["stage"] = STAGE_PAYMENT_CHOICE
+        set_stage(state, STAGE_PAYMENT_CHOICE)
+        state["failure_count"] = 0
         return payment_prompt_message()
     if action == "add_more_items":
-        state["stage"] = STAGE_CHECKOUT
+        set_stage(state, STAGE_CHECKOUT)
         state["waiting_for_order"] = True
-        return f"Of course.\n\nPlease add more items from {MENU_URL} and send the updated checkout here."
+        state["checkout_mode"] = "replace"
+        state["failure_count"] = 0
+        return choose_variant(
+            state,
+            "add_more_items",
+            [
+                f"Of course.\n\nPlease add more items from {MENU_URL} and send the updated checkout here.",
+                f"Absolutely.\n\nUpdate your cart on {MENU_URL} and send the latest checkout here.",
+                f"Sure.\n\nAdd what you’d like on {MENU_URL}, then send me the refreshed checkout.",
+            ],
+        )
     if action == "modify_order":
-        state["stage"] = STAGE_ORDER_ACTION
-        return "Tell me the change in one line. Example: remove pasta alfredo or change margherita pizza to 1."
+        set_stage(state, STAGE_ORDER_ACTION)
+        state["failure_count"] = 0
+        return choose_variant(
+            state,
+            "modify_order",
+            [
+                "Tell me the change in one line. Example: remove pasta alfredo or change margherita pizza to 1.",
+                "Share the change in one line. Example: remove pasta alfredo or change margherita pizza to 1.",
+                "Just tell me the edit in one line. Example: remove pasta alfredo or change margherita pizza to 1.",
+            ],
+        )
     if action == "remove_item":
         item_name = (decision.get("item_name") or "").strip().lower()
         if not item_name:
@@ -671,7 +724,8 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
         updated, changed = modify_order_from_text(state["order"], f"remove {item_name}")
         if changed:
             state["order"] = updated
-            state["stage"] = STAGE_ORDER_ACTION
+            set_stage(state, STAGE_ORDER_ACTION)
+            state["failure_count"] = 0
             return generate_order_summary(state["order"])
         return "I couldn\u2019t match that item. Please use the exact item name from your checkout."
     if action == "update_quantity":
@@ -682,18 +736,28 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
         updated, changed = modify_order_from_text(state["order"], f"change {item_name} to {quantity}")
         if changed:
             state["order"] = updated
-            state["stage"] = STAGE_ORDER_ACTION
+            set_stage(state, STAGE_ORDER_ACTION)
+            state["failure_count"] = 0
             return generate_order_summary(state["order"])
         return "I couldn\u2019t match that item. Please use the exact item name from your checkout."
     if action == "send_payment_link":
         state["payment_method"] = "online"
         state["payment_status"] = "pending"
-        state["stage"] = STAGE_PAYMENT_CONFIRMATION
+        set_stage(state, STAGE_PAYMENT_CONFIRMATION)
+        state["failure_count"] = 0
         link = generate_payment_link(user_id, state)
         if link == "Payment link unavailable.":
-            state["stage"] = STAGE_PAYMENT_CHOICE
+            set_stage(state, STAGE_PAYMENT_CHOICE)
             return "Online payment is unavailable right now. Please choose 1 or 2."
-        return f"Your secure payment link is ready \U0001f4b3\n{link}\n\nReply 'paid' or 'yes' once done."
+        return choose_variant(
+            state,
+            "payment_link",
+            [
+                f"Your secure payment link is ready \U0001f4b3\n{link}\n\nReply 'paid' or 'yes' once done.",
+                f"Here’s your payment link \U0001f4b3\n{link}\n\nOnce it’s completed, reply 'paid' or 'yes'.",
+                f"Your checkout link is ready \U0001f4b3\n{link}\n\nAfter payment, reply 'paid' or 'yes'.",
+            ],
+        )
     if action == "check_payment_status":
         state["payment_verification_attempts"] += 1
         if state.get("payment_method") != "online":
@@ -706,30 +770,56 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
             logger.warning("Payment verification failed: %s", exc)
             if state["payment_verification_attempts"] >= 3:
                 return mark_handoff(state)
-            return "I couldn\u2019t verify the payment yet. Please wait a moment and reply 'paid' again."
-        return "I can\u2019t confirm the payment yet. Please complete the payment link, then reply 'paid'."
+            return choose_variant(
+                state,
+                "payment_verify_error",
+                [
+                    "I couldn\u2019t verify the payment yet. Please wait a moment and reply 'paid' again.",
+                    "The payment gateway hasn\u2019t confirmed it yet. Give it a moment, then reply 'paid' again.",
+                ],
+            )
+        return choose_variant(
+            state,
+            "payment_not_found",
+            [
+                "I can\u2019t confirm the payment yet. Please complete the payment link, then reply 'paid'.",
+                "I’m still waiting for payment confirmation from the gateway. Once it updates, reply 'paid' again.",
+                "The payment hasn’t reflected on my side yet. Please give it a moment, then reply 'paid' again.",
+            ],
+        )
     if action == "pay_at_counter":
         state["payment_method"] = "counter"
+        state["failure_count"] = 0
         finalize_confirmation(state)
         return "Perfect. Payment is marked for counter. Your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
     if action == "check_order_stage":
         return check_order_stage_message(state)
     if action == "book_table":
         state["intent"] = "reservation"
-        state["stage"] = STAGE_RESERVATION_DETAILS
+        set_stage(state, STAGE_RESERVATION_DETAILS)
+        state["failure_count"] = 0
         return "Please share your name, date, time, and guest count."
     if action == "check_reservation":
         state["intent"] = "reservation"
-        state["stage"] = STAGE_RESERVATION_CHECK
+        set_stage(state, STAGE_RESERVATION_CHECK)
+        state["failure_count"] = 0
         return "Please share your reservation name and date. I\u2019ll help you check it."
     if action == "handoff_to_human":
         return mark_handoff(state)
     if state["stage"] == STAGE_HUMAN_HANDOFF:
-        return handoff_message()
+        return choose_variant(
+            state,
+            "handoff_repeat",
+            [
+                "My teammate is still reviewing this for you.",
+                "Our team is checking this now.",
+                "A teammate is already on this and will follow up shortly.",
+            ],
+        )
     if state["stage"] in {STAGE_PREPARING, STAGE_SERVED}:
         return check_order_stage_message(state)
     if lowered in {"hello", "hi", "hey"} and not state["order"]["items"]:
-        state["stage"] = STAGE_MAIN_MENU
+        set_stage(state, STAGE_MAIN_MENU)
         return "Please reply with 1 to order food, 2 to book a table, or 3 to check a reservation."
     state["failure_count"] += 1
     if state["failure_count"] >= 3:
@@ -775,13 +865,40 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         return execute_action(user_id, state, {"action": "pay_at_counter"}, text)
     if intent == "payment_confirmation":
         return execute_action(user_id, state, {"action": "check_payment_status"}, text)
+    if intent == "payment_claim":
+        state["payment_verification_attempts"] += 1
+        try:
+            if verify_online_payment(state):
+                finalize_confirmation(state)
+                return "Thank you for waiting. I’ve confirmed the payment and your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
+        except requests.RequestException as exc:
+            logger.warning("Payment verification failed: %s", exc)
+        return choose_variant(
+            state,
+            "payment_claim",
+            [
+                "I hear you. I’m re-checking the payment now. If the gateway is delayed, reply 'paid' again in a moment.",
+                "Understood. I’m checking with the payment gateway again. If it still hasn’t updated, reply 'paid' in a moment.",
+                "Thanks for flagging it. I’m checking the payment status again right now. If it’s still delayed, reply 'paid' shortly.",
+            ],
+        )
     if intent == "payment_pending":
         return "No problem. Complete the payment when you’re ready, then reply 'paid'."
+    if intent == "cancel_handoff":
+        if state.get("payment_method") == "online" and state.get("payment_status") != "done":
+            state["handoff_requested"] = False
+            set_stage(state, STAGE_PAYMENT_CONFIRMATION)
+            return "I’m still here with you. I’ll keep checking the payment. Give it a minute, then reply 'paid' again."
+        state["handoff_requested"] = False
+        previous = state.get("previous_stage", STAGE_MAIN_MENU)
+        set_stage(state, previous if previous != STAGE_HUMAN_HANDOFF else STAGE_MAIN_MENU)
+        return "Of course. I’m with you. Let’s continue here."
     if intent == "modify_inline":
         updated, changed = modify_order_from_text(state["order"], text)
         if changed:
             state["order"] = updated
-            state["stage"] = STAGE_ORDER_ACTION
+            set_stage(state, STAGE_ORDER_ACTION)
+            state["failure_count"] = 0
             return generate_order_summary(state["order"])
         state["failure_count"] += 1
         return "I couldn\u2019t match that item. Please use the exact item name from your checkout."
@@ -792,7 +909,15 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
             return "I couldn\u2019t read that order clearly. Please resend it in the checkout format with name, items, and total."
         state["intent"] = "order"
         state["waiting_for_order"] = False
-        state["order"] = merge_orders(state["order"], parsed)
+        if state.get("checkout_mode") == "replace":
+            state["order"] = {
+                "name": parsed.get("name", ""),
+                "items": parsed.get("items", []),
+                "total": parsed.get("total", Decimal("0.00")),
+                "currency": parsed.get("currency", DEFAULT_CURRENCY),
+            }
+        else:
+            state["order"] = merge_orders(state["order"], parsed)
         update_customer_profile(state, parsed.get("profile", {}))
         state["order_confirmed"] = False
         state["payment_status"] = "pending"
@@ -800,7 +925,9 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         state["payment_link"] = ""
         state["payment_link_id"] = ""
         state["payment_verification_attempts"] = 0
-        state["stage"] = STAGE_ORDER_ACTION
+        state["checkout_mode"] = "append"
+        set_stage(state, STAGE_ORDER_ACTION)
+        state["failure_count"] = 0
         append_sheet_log(user_id, state, "order_updated")
         return generate_order_summary(state["order"])
     if state["stage"] in {STAGE_RESERVATION_DETAILS, STAGE_RESERVATION_CHECK}:

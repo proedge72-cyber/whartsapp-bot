@@ -180,13 +180,13 @@ def verify():
 # ===== HANDLE INCOMING MESSAGES (POST) =====
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    data = request.get_json(silent=True)
+    raw_data = request.data
+    print("🔥 RAW BODY:", raw_data)
 
-    if not data:
-        print("❌ No JSON received")
-        return "OK", 200
+    try:
+        data = request.get_json(force=True)
 
-    print("🔥 RAW DATA RECEIVED:", data)
+        print("🔥 PARSED JSON:", data)
 
     try:
         entry = data.get('entry', [])

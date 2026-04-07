@@ -145,6 +145,7 @@ def create_default_state() -> Dict[str, Any]:
         "payment_link": "",
         "payment_link_id": "",
         "payment_verification_attempts": 0,
+        "payment_pending_since": None,
         "order_stage": "none",
         "reservation_status": "none",
         "reservation_details": {},
@@ -379,8 +380,24 @@ def generate_order_summary(order: Dict[str, Any], state: Optional[Dict[str, Any]
             ],
         )
     lines = [intro, ""]
+    if state is None:
+        detail_style = 0
+    else:
+        detail_style = (
+            int(state.get("response_counters", {}).get("order_detail_style", 0))
+            + int(state.get("response_seed", 0))
+            + int(state.get("order_sequence", 0))
+        ) % 3
+        state.setdefault("response_counters", {})["order_detail_style"] = state.get("response_counters", {}).get("order_detail_style", 0) + 1
+
     for item in order.get("items", []):
-        lines.append(f"{item['name']} x{item['qty']} \u2014 {money_to_text(item['price'], currency)}")
+        if detail_style == 0:
+            line = f"{item['name']} x{item['qty']} \u2014 {money_to_text(item['price'], currency)}"
+        elif detail_style == 1:
+            line = f"\u2022 {item['name']} | Qty {item['qty']} | {money_to_text(item['price'], currency)}"
+        else:
+            line = f"- {item['qty']} x {item['name']} for {money_to_text(item['price'], currency)}"
+        lines.append(line)
     lines.extend(
         [
             "",
@@ -390,6 +407,68 @@ def generate_order_summary(order: Dict[str, Any], state: Optional[Dict[str, Any]
             "1. Confirm Order",
             "2. Add More Items",
             "3. Modify Order",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def generate_final_order_summary(state: Dict[str, Any]) -> str:
+    profile = state.get("customer_profile", {})
+    order = state.get("order", {})
+    currency = order.get("currency", DEFAULT_CURRENCY)
+    header = choose_variant(
+        state,
+        "final_summary_header",
+        [
+            "Order summary for you:",
+            "Your confirmed order summary:",
+            "Here’s your final order summary:",
+        ],
+    )
+    payment_label = {
+        "online": "Paid Online",
+        "counter": "Pay at Counter",
+        "cash_on_table": "Cash on Table",
+    }.get(state.get("payment_method", ""), "Pending")
+
+    lines = [header, ""]
+    if profile.get("name"):
+        lines.append(f"Name: {profile['name']}")
+    if profile.get("mobile"):
+        lines.append(f"Mobile: {profile['mobile']}")
+    if profile.get("email"):
+        lines.append(f"Email: {profile['email']}")
+    if profile.get("service_type"):
+        lines.append(f"Service: {profile['service_type']}")
+    if profile.get("preferred_time"):
+        lines.append(f"Time: {profile['preferred_time']}")
+    if profile.get("guests"):
+        lines.append(f"Guests: {profile['guests']}")
+
+    lines.append("")
+    lines.append("Items:")
+
+    detail_style = (
+        int(state.get("response_counters", {}).get("final_detail_style", 0))
+        + int(state.get("response_seed", 0))
+        + int(state.get("order_sequence", 0))
+    ) % 3
+    state.setdefault("response_counters", {})["final_detail_style"] = state.get("response_counters", {}).get("final_detail_style", 0) + 1
+
+    for item in order.get("items", []):
+        if detail_style == 0:
+            lines.append(f"\u2022 {item['name']} x{item['qty']} \u2014 {money_to_text(item['price'], currency)}")
+        elif detail_style == 1:
+            lines.append(f"- {item['qty']} x {item['name']} | {money_to_text(item['price'], currency)}")
+        else:
+            lines.append(f"{item['name']} | Qty {item['qty']} | {money_to_text(item['price'], currency)}")
+
+    lines.extend(
+        [
+            "",
+            f"Total: {money_to_text(order.get('total', Decimal('0.00')), currency)}",
+            f"Payment: {payment_label}",
+            f"Order Status: {state.get('order_stage', 'none').title()}",
         ]
     )
     return "\n".join(lines)
@@ -739,6 +818,7 @@ def finalize_confirmation(state: Dict[str, Any]) -> None:
     state["stage_updated_at"] = now
     state["waiting_for_order"] = False
     state["failure_count"] = 0
+    state["payment_pending_since"] = None
 
 
 def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any], user_text: str) -> str:
@@ -818,6 +898,7 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
     if action == "send_payment_link":
         state["payment_method"] = "online"
         state["payment_status"] = "pending"
+        state["payment_pending_since"] = None
         set_stage(state, STAGE_PAYMENT_CONFIRMATION)
         state["failure_count"] = 0
         link = generate_payment_link(user_id, state)
@@ -840,33 +921,55 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
         try:
             if verify_online_payment(state):
                 finalize_confirmation(state)
-                return "Payment received. Your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
+                return (
+                    "Payment received. Your order is now being prepared \U0001f37d\ufe0f\n\n"
+                    "\u23f3 Estimated time: 15 minutes\n\n"
+                    f"{generate_final_order_summary(state)}"
+                )
         except requests.RequestException as exc:
             logger.warning("Payment verification failed: %s", exc)
-            if state["payment_verification_attempts"] >= 3:
-                return mark_handoff(state)
+        pending_since = state.get("payment_pending_since")
+        now = utc_now()
+        if not pending_since:
+            state["payment_pending_since"] = now
             return choose_variant(
                 state,
-                "payment_verify_error",
+                "payment_wait_60",
                 [
-                    "I couldn\u2019t verify the payment yet. Please wait a moment and reply 'paid' again.",
-                    "The payment gateway hasn\u2019t confirmed it yet. Give it a moment, then reply 'paid' again.",
+                    "I’m not seeing the payment in the gateway yet. Please wait 60 seconds. If the gateway updates it, I’ll confirm you right away.",
+                    "The gateway hasn’t reflected the payment yet. Please give it 60 seconds. Once it updates, I’ll confirm it for you.",
+                    "I can’t see the payment on the gateway yet. Please wait 60 seconds and I’ll confirm it as soon as it appears.",
                 ],
             )
-        return choose_variant(
-            state,
-            "payment_not_found",
-            [
-                "I can\u2019t confirm the payment yet. Please complete the payment link, then reply 'paid'.",
-                "I’m still waiting for payment confirmation from the gateway. Once it updates, reply 'paid' again.",
-                "The payment hasn’t reflected on my side yet. Please give it a moment, then reply 'paid' again.",
-            ],
+        if now - pending_since < timedelta(seconds=60):
+            return choose_variant(
+                state,
+                "payment_waiting_window",
+                [
+                    "I’m still checking the gateway. Please allow the full 60 seconds and I’ll confirm it if the update arrives.",
+                    "The 60-second gateway check is still running. Give me a little more time and I’ll confirm it if it comes through.",
+                    "I’m still within the payment check window. Please wait a bit longer and I’ll confirm it if the gateway updates.",
+                ],
+            )
+
+        state["payment_method"] = "counter"
+        state["payment_status"] = "done"
+        finalize_confirmation(state)
+        return (
+            "Payment is not arrived in our gateway, so payment mode is now set to counter.\n\n"
+            "If you already made the payment, please share your payment slip at the counter.\n\n"
+            "Thanks for your order.\n\n"
+            f"{generate_final_order_summary(state)}"
         )
     if action == "pay_at_counter":
         state["payment_method"] = "counter"
         state["failure_count"] = 0
         finalize_confirmation(state)
-        return "Perfect. Payment is marked for counter. Your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
+        return (
+            "Perfect. Payment is marked for counter. Your order is now being prepared \U0001f37d\ufe0f\n\n"
+            "\u23f3 Estimated time: 15 minutes\n\n"
+            f"{generate_final_order_summary(state)}"
+        )
     if action == "check_order_stage":
         return check_order_stage_message(state)
     if action == "book_table":
@@ -965,7 +1068,11 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         try:
             if verify_online_payment(state):
                 finalize_confirmation(state)
-                return "Thank you for waiting. I’ve confirmed the payment and your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
+                return (
+                    "Thank you for waiting. I’ve confirmed the payment and your order is now being prepared \U0001f37d\ufe0f\n\n"
+                    "\u23f3 Estimated time: 15 minutes\n\n"
+                    f"{generate_final_order_summary(state)}"
+                )
         except requests.RequestException as exc:
             logger.warning("Payment verification failed: %s", exc)
         if state.get("payment_method") != "online":
@@ -978,14 +1085,38 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
                     "I’m not seeing this order under online payment yet. If you paid with the link, I’ll keep checking the gateway.",
                 ],
             )
-        return choose_variant(
-            state,
-            "payment_claim",
-            [
-                "I hear you. I’m re-checking the payment now. If the gateway is delayed, reply 'paid' again in a moment.",
-                "Understood. I’m checking with the payment gateway again. If it still hasn’t updated, reply 'paid' in a moment.",
-                "Thanks for flagging it. I’m checking the payment status again right now. If it’s still delayed, reply 'paid' shortly.",
-            ],
+        pending_since = state.get("payment_pending_since")
+        now = utc_now()
+        if not pending_since:
+            state["payment_pending_since"] = now
+            return choose_variant(
+                state,
+                "payment_claim_wait_60",
+                [
+                    "I hear you. The payment is not visible in the gateway yet. Please wait 60 seconds. If it updates, I’ll confirm you.",
+                    "Understood. I’m not seeing it on the gateway yet. Please give it 60 seconds and I’ll confirm it if the update arrives.",
+                    "Thanks for telling me. The gateway hasn’t reflected it yet. Please wait 60 seconds and I’ll confirm it if it appears.",
+                ],
+            )
+        if now - pending_since < timedelta(seconds=60):
+            return choose_variant(
+                state,
+                "payment_claim_waiting_window",
+                [
+                    "I’m still checking the gateway for your payment. Please allow the full 60 seconds.",
+                    "The 60-second verification window is still active. I’m checking for the update now.",
+                    "I’m still within the payment-check window. Give me a little more time to confirm it.",
+                ],
+            )
+
+        state["payment_method"] = "counter"
+        state["payment_status"] = "done"
+        finalize_confirmation(state)
+        return (
+            "Payment is not arrived in our gateway, so payment mode is now set to counter.\n\n"
+            "If you already make the payment, please share your payment slip at the counter.\n\n"
+            "Thanks for your order.\n\n"
+            f"{generate_final_order_summary(state)}"
         )
     if intent == "payment_pending":
         return "No problem. Complete the payment when you’re ready, then reply 'paid'."

@@ -58,6 +58,7 @@ def create_default_state() -> Dict[str, Any]:
         "payment_method": "",
         "payment_link": "",
         "awaiting_payment_choice": False,
+        "awaiting_payment_confirmation": False,
         "order_stage": "none",
         "reservation_status": "none",
         "processed_messages": [],
@@ -326,6 +327,9 @@ def serialize_state(state: Dict[str, Any]) -> Dict[str, Any]:
     safe["order"]["total"] = str(safe["order"]["total"])
     for item in safe["order"]["items"]:
         item["price"] = str(item["price"])
+    for key in ("last_message_at", "confirmed_at", "stage_updated_at"):
+        if safe.get(key):
+            safe[key] = safe[key].isoformat()
     return safe
 
 
@@ -429,8 +433,7 @@ def payment_prompt_message() -> str:
     return (
         "How would you like to pay?\n\n"
         "1. Pay Online \U0001f4b3\n"
-        "2. Cash on Table \U0001f4b5\n"
-        "3. Pay at Counter"
+        "2. Pay at Counter"
     )
 
 
@@ -441,37 +444,36 @@ def handle_payment_choice(user_id: str, state: Dict[str, Any], text: str) -> str
         state["payment_method"] = "online"
         state["payment_status"] = "pending"
         state["awaiting_payment_choice"] = False
+        state["awaiting_payment_confirmation"] = True
         if link == "Payment link unavailable.":
-            return "Online payment is unavailable right now. Please choose cash on table or pay at counter."
-        return f"Your secure payment link is ready \U0001f4b3\n{link}\n\nReply 'paid' once done."
+            state["awaiting_payment_confirmation"] = False
+            state["awaiting_payment_choice"] = True
+            return "Online payment is unavailable right now. Please choose 1 or 2."
+        return f"Your secure payment link is ready \U0001f4b3\n{link}\n\nReply 'paid' or 'yes' once done."
 
-    if normalized in {"2", "cash on table", "cash"}:
-        state["payment_method"] = "cash_on_table"
-        state["payment_status"] = "done"
-        state["awaiting_payment_choice"] = False
-        finalize_confirmation(state)
-        return "Perfect. Payment is marked for table. Your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
-
-    if normalized in {"3", "pay at counter", "counter"}:
+    if normalized in {"2", "pay at counter", "counter"}:
         state["payment_method"] = "counter"
         state["payment_status"] = "done"
         state["awaiting_payment_choice"] = False
+        state["awaiting_payment_confirmation"] = False
         finalize_confirmation(state)
         return "Perfect. Payment is marked for counter. Your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
 
-    if normalized == "paid":
+    if normalized in {"paid", "yes", "done", "completed"}:
         state["payment_status"] = "done"
         state["awaiting_payment_choice"] = False
+        state["awaiting_payment_confirmation"] = False
         finalize_confirmation(state)
         return "Payment received. Your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
 
-    return "Please choose 1, 2 or 3 for payment."
+    return "Please choose 1 or 2 for payment."
 
 
 def finalize_confirmation(state: Dict[str, Any]) -> None:
     state["order_confirmed"] = True
     state["order_stage"] = "preparing"
     state["awaiting_payment_choice"] = False
+    state["awaiting_payment_confirmation"] = False
     now = datetime.now(timezone.utc)
     state["confirmed_at"] = now
     state["stage_updated_at"] = now
@@ -509,6 +511,8 @@ def handle_order_flow(user_id: str, state: Dict[str, Any], text: str) -> str:
 
     if state["awaiting_payment_choice"]:
         return handle_payment_choice(user_id, state, lowered)
+    if state["awaiting_payment_confirmation"]:
+        return handle_payment_choice(user_id, state, lowered)
 
     if lowered == "1" and not state["order"]["items"]:
         state["intent"] = "order"
@@ -526,6 +530,7 @@ def handle_order_flow(user_id: str, state: Dict[str, Any], text: str) -> str:
 
     if lowered in {"1", "confirm order", "confirm"} and state["order"]["items"] and not state["order_confirmed"]:
         state["awaiting_payment_choice"] = True
+        state["awaiting_payment_confirmation"] = False
         return payment_prompt_message()
 
     if lowered.startswith(("remove ", "change ", "update ", "set ")):
@@ -548,6 +553,7 @@ def handle_order_flow(user_id: str, state: Dict[str, Any], text: str) -> str:
         state["payment_method"] = ""
         state["payment_link"] = ""
         state["awaiting_payment_choice"] = False
+        state["awaiting_payment_confirmation"] = False
         append_sheet_log(user_id, state, "order_updated")
         return generate_order_summary(state["order"])
 

@@ -123,6 +123,8 @@ def create_default_state() -> Dict[str, Any]:
         "previous_stage": STAGE_MAIN_MENU,
         "waiting_for_order": False,
         "checkout_mode": "fresh",
+        "response_seed": 0,
+        "order_sequence": 0,
         "order": {
             "name": "",
             "items": [],
@@ -202,9 +204,15 @@ def get_state(user_id: str) -> Dict[str, Any]:
         ).fetchone()
     if not row:
         state = create_default_state()
+        state["response_seed"] = sum(ord(ch) for ch in user_id) % 17
         save_state(user_id, state)
         return state
-    return deserialize_state(row["state_json"])
+    state = deserialize_state(row["state_json"])
+    if "response_seed" not in state:
+        state["response_seed"] = sum(ord(ch) for ch in user_id) % 17
+    if "order_sequence" not in state:
+        state["order_sequence"] = 0
+    return state
 
 
 def normalize_text(text: str) -> str:
@@ -511,7 +519,8 @@ def set_stage(state: Dict[str, Any], stage: str) -> None:
 
 def choose_variant(state: Dict[str, Any], key: str, options: List[str]) -> str:
     counters = state.setdefault("response_counters", {})
-    index = counters.get(key, 0) % len(options)
+    seed = int(state.get("response_seed", 0)) + int(state.get("order_sequence", 0))
+    index = (counters.get(key, 0) + seed) % len(options)
     counters[key] = counters.get(key, 0) + 1
     return options[index]
 
@@ -532,8 +541,9 @@ def greeting_message_for_state(state: Dict[str, Any]) -> str:
         "greeting",
         [
             "Welcome to Agnikara \U0001f37d\ufe0f",
-            "A warm welcome to Agnikara \U0001f37d\ufe0f",
-            "Good to have you at Agnikara \U0001f37d\ufe0f",
+            "A warm welcome to Agnikara \U0001f525",
+            "Good to have you at Agnikara \U0001f60c",
+            "Hello from Agnikara \U0001f389",
         ],
     )
     assist = choose_variant(
@@ -560,8 +570,9 @@ def order_instruction_message(state: Dict[str, Any]) -> str:
         "order_instruction_intro",
         [
             "Perfect \U0001f60c",
-            "Lovely \U0001f60c",
-            "Absolutely \U0001f60c",
+            "Lovely \U0001f60a",
+            "Absolutely \U0001f525",
+            "Brilliant \U0001f44c",
         ],
     )
     closing = choose_variant(
@@ -584,6 +595,7 @@ def payment_prompt_message(state: Dict[str, Any]) -> str:
             "How would you like to pay?",
             "How would you prefer to pay?",
             "What payment option works best for you?",
+            "How would you like to settle this order?",
         ],
     )
     return f"{intro}\n\n1. Pay Online \U0001f4b3\n2. Pay at Counter"
@@ -639,7 +651,7 @@ def infer_intent_rule(text: str, state: Dict[str, Any]) -> str:
         return "pay_at_counter"
     if lowered in {"paid", "yes", "done", "completed"} and state["stage"] == STAGE_PAYMENT_CONFIRMATION:
         return "payment_confirmation"
-    if state["stage"] == STAGE_PAYMENT_CONFIRMATION and any(
+    if any(
         phrase in lowered
         for phrase in {"already paid", "already make", "already made", "i paid", "i have paid", "payment done"}
     ):
@@ -929,6 +941,26 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
     if intent == "payment_confirmation":
         return execute_action(user_id, state, {"action": "check_payment_status"}, text)
     if intent == "payment_claim":
+        if state.get("payment_status") == "done" and state.get("payment_method") == "counter":
+            return choose_variant(
+                state,
+                "payment_claim_counter",
+                [
+                    "You’re all set. This order is already marked for counter payment and is being prepared now.",
+                    "You’re good to go. This one is already set as pay at counter and the kitchen is on it.",
+                    "No issue. This order is already marked for counter payment, and preparation is underway.",
+                ],
+            )
+        if state.get("payment_status") == "done":
+            return choose_variant(
+                state,
+                "payment_claim_done",
+                [
+                    "You’re all set. I already have this order marked as paid.",
+                    "No worries, this order is already marked as paid on my side.",
+                    "All good, I already have payment recorded for this order.",
+                ],
+            )
         state["payment_verification_attempts"] += 1
         try:
             if verify_online_payment(state):
@@ -936,6 +968,16 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
                 return "Thank you for waiting. I’ve confirmed the payment and your order is now being prepared \U0001f37d\ufe0f\n\n\u23f3 Estimated time: 15 minutes"
         except requests.RequestException as exc:
             logger.warning("Payment verification failed: %s", exc)
+        if state.get("payment_method") != "online":
+            return choose_variant(
+                state,
+                "payment_claim_no_online",
+                [
+                    "I don’t have this order marked under online payment. If you used the payment link, give me a moment and I’ll keep checking.",
+                    "This order isn’t currently tagged as an online payment on my side. If you paid through the link, I can keep rechecking it.",
+                    "I’m not seeing this order under online payment yet. If you paid with the link, I’ll keep checking the gateway.",
+                ],
+            )
         return choose_variant(
             state,
             "payment_claim",
@@ -988,6 +1030,7 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         state["payment_link"] = ""
         state["payment_link_id"] = ""
         state["payment_verification_attempts"] = 0
+        state["order_sequence"] = int(state.get("order_sequence", 0)) + 1
         state["checkout_mode"] = "append"
         set_stage(state, STAGE_ORDER_ACTION)
         state["failure_count"] = 0

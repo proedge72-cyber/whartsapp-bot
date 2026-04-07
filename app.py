@@ -188,19 +188,19 @@ def webhook():
 
         print("User message:", message)
 
-       message = message.lower()
+        message = message.lower()
 
-# ===== CONTROL LOGIC =====
+        # ===== CONTROL LOGIC =====
 
-if any(word in message for word in ["menu", "show menu", "website", "site", "link"]):
-    reply = """Visit our website and explore full menu here:
+        if any(word in message for word in ["menu", "show menu", "website", "site", "link"]):
+            reply = """Visit our website and explore full menu here:
 https://agnikara.netlify.app/
 
 Direct menu:
 https://agnikara.netlify.app/#menu"""
 
-elif "not talk to human" in message or "no human" in message:
-    reply = """You can order directly from our website:
+        elif "not talk to human" in message or "no human" in message:
+            reply = """You can order directly from our website:
 
 Menu:
 https://agnikara.netlify.app/#menu
@@ -212,14 +212,16 @@ Steps:
 
 You can also book a table from the website."""
 
-else:
-    reply = generate_ai_reply(message)
+        else:
+            reply = generate_ai_reply(message)
+
+        # ✅ THIS WAS MISSING
+        send_message(sender, reply)
 
     except Exception as e:
         print("Error:", e)
 
     return "OK", 200
-
 
 # ===== SEND =====
 def send_message(to, text):

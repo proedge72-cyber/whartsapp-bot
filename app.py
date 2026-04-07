@@ -212,7 +212,12 @@ def webhook():
         print("USER:", user_msg)
 
         # 🔥 USE AI HERE
-        reply = generate_ai_reply(user_msg)
+        msg = user_msg.lower()
+
+if "menu" in msg:
+    reply = "View full menu here 🔥\nhttps://agnikara.netlify.app/#menu\n\nWant recommendations?"
+else:
+    reply = generate_ai_reply(user_msg)
 
         send_message(sender, reply)
 

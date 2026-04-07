@@ -177,37 +177,43 @@ def verify():
     return "Error", 403
 
 
-# ===== RECEIVE =====
+# ===== HANDLE INCOMING MESSAGES (POST) =====
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json()
 
     try:
-        message = data['entry'][0]['changes'][0]['value']['messages'][0]['text']['body'].lower()
+        message = data['entry'][0]['changes'][0]['value']['messages'][0]['text']['body']
         sender = data['entry'][0]['changes'][0]['value']['messages'][0]['from']
 
-        # ===== INTELLIGENT ROUTING =====
+        print("User message:", message)
 
-        if "not talk to human" in message or "no human" in message:
-            reply = """You can explore our menu and order directly here:
+       message = message.lower()
 
-https://agnikara.netlify.app/#menu
+# ===== CONTROL LOGIC =====
 
-Or visit website:
+if any(word in message for word in ["menu", "show menu", "website", "site", "link"]):
+    reply = """Visit our website and explore full menu here:
 https://agnikara.netlify.app/
 
-To order:
-Simply add items from menu and checkout via WhatsApp.
+Direct menu:
+https://agnikara.netlify.app/#menu"""
+
+elif "not talk to human" in message or "no human" in message:
+    reply = """You can order directly from our website:
+
+Menu:
+https://agnikara.netlify.app/#menu
+
+Steps:
+1. Open menu
+2. Add items to cart
+3. Checkout via WhatsApp
 
 You can also book a table from the website."""
 
-        elif "menu" in message:
-            reply = "Here is our menu:\nhttps://agnikara.netlify.app/#menu"
-
-        else:
-            reply = generate_ai_reply(message)
-
-        send_message(sender, reply)
+else:
+    reply = generate_ai_reply(message)
 
     except Exception as e:
         print("Error:", e)

@@ -236,9 +236,11 @@ def send_message(to, text):
         "text": {"body": text}
     }
 
-    requests.post(url, headers=headers, json=payload)
+    response = requests.post(url, headers=headers, json=payload)
 
-
+    print("WHATSAPP RESPONSE:", response.status_code)
+    print("WHATSAPP RESPONSE BODY:", response.text)
+    
 # ===== RUN =====
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=10000)

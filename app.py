@@ -125,7 +125,11 @@ def create_default_state() -> Dict[str, Any]:
         "checkout_mode": "fresh",
         "response_seed": 0,
         "order_sequence": 0,
+        "active_order_id": "",
+        "last_completed_order_id": "",
+        "orders": {},
         "order": {
+            "order_id": "",
             "name": "",
             "items": [],
             "total": Decimal("0.00"),
@@ -164,7 +168,14 @@ def serialize_state(state: Dict[str, Any]) -> Dict[str, Any]:
     safe["order"]["total"] = str(safe["order"]["total"])
     for item in safe["order"]["items"]:
         item["price"] = str(item["price"])
-    for key in ("last_message_at", "confirmed_at", "stage_updated_at"):
+    for order_id, record in safe.get("orders", {}).items():
+        record["total"] = str(record.get("total", "0.00"))
+        for item in record.get("items", []):
+            item["price"] = str(item["price"])
+        for key in ("created_at", "updated_at", "confirmed_at"):
+            if record.get(key):
+                record[key] = record[key].isoformat()
+    for key in ("last_message_at", "confirmed_at", "stage_updated_at", "payment_pending_since"):
         if safe.get(key):
             safe[key] = safe[key].isoformat()
     return safe
@@ -175,13 +186,21 @@ def deserialize_state(state_json: str) -> Dict[str, Any]:
     state["order"]["total"] = Decimal(state["order"].get("total", "0.00"))
     for item in state["order"]["items"]:
         item["price"] = Decimal(item.get("price", "0.00"))
-    for key in ("last_message_at", "confirmed_at", "stage_updated_at"):
+    for order_id, record in state.get("orders", {}).items():
+        record["total"] = Decimal(record.get("total", "0.00"))
+        for item in record.get("items", []):
+            item["price"] = Decimal(item.get("price", "0.00"))
+        for key in ("created_at", "updated_at", "confirmed_at"):
+            if record.get(key):
+                record[key] = datetime.fromisoformat(record[key])
+    for key in ("last_message_at", "confirmed_at", "stage_updated_at", "payment_pending_since"):
         if state.get(key):
             state[key] = datetime.fromisoformat(state[key])
     return state
 
 
 def save_state(user_id: str, state: Dict[str, Any]) -> None:
+    sync_active_order_record(state)
     payload = json.dumps(serialize_state(state))
     with db_lock:
         db.execute(
@@ -213,7 +232,97 @@ def get_state(user_id: str) -> Dict[str, Any]:
         state["response_seed"] = sum(ord(ch) for ch in user_id) % 17
     if "order_sequence" not in state:
         state["order_sequence"] = 0
+    if "active_order_id" not in state:
+        state["active_order_id"] = state.get("order", {}).get("order_id", "")
+    if "last_completed_order_id" not in state:
+        state["last_completed_order_id"] = ""
+    if "orders" not in state:
+        state["orders"] = {}
     return state
+
+
+def empty_order() -> Dict[str, Any]:
+    return {
+        "order_id": "",
+        "name": "",
+        "items": [],
+        "total": Decimal("0.00"),
+        "currency": DEFAULT_CURRENCY,
+    }
+
+
+def generate_order_id(user_id: str, state: Dict[str, Any]) -> str:
+    state["order_sequence"] = int(state.get("order_sequence", 0)) + 1
+    suffix = "".join(ch for ch in user_id if ch.isdigit())[-4:] or "0000"
+    return f"AGN-{suffix}-{state['order_sequence']:04d}"
+
+
+def sync_active_order_record(state: Dict[str, Any]) -> None:
+    order = state.get("order", {})
+    order_id = order.get("order_id") or state.get("active_order_id", "")
+    if not order_id:
+        return
+    state["active_order_id"] = order_id
+    state.setdefault("orders", {})[order_id] = {
+        "order_id": order_id,
+        "name": order.get("name", ""),
+        "items": deepcopy(order.get("items", [])),
+        "total": order.get("total", Decimal("0.00")),
+        "currency": order.get("currency", DEFAULT_CURRENCY),
+        "payment_status": state.get("payment_status", "pending"),
+        "payment_method": state.get("payment_method", ""),
+        "order_stage": state.get("order_stage", "none"),
+        "customer_profile": deepcopy(state.get("customer_profile", {})),
+        "created_at": state.setdefault("orders", {}).get(order_id, {}).get("created_at", utc_now()),
+        "updated_at": utc_now(),
+        "confirmed_at": state.get("confirmed_at"),
+    }
+
+
+def start_new_order(state: Dict[str, Any], user_id: str) -> str:
+    sync_active_order_record(state)
+    new_order_id = generate_order_id(user_id, state)
+    state["active_order_id"] = new_order_id
+    state["order"] = empty_order()
+    state["order"]["order_id"] = new_order_id
+    state["order"]["name"] = state.get("customer_profile", {}).get("name", "")
+    state["payment_status"] = "pending"
+    state["payment_method"] = ""
+    state["payment_link"] = ""
+    state["payment_link_id"] = ""
+    state["payment_verification_attempts"] = 0
+    state["payment_pending_since"] = None
+    state["order_confirmed"] = False
+    state["order_stage"] = "none"
+    state["confirmed_at"] = None
+    state.setdefault("orders", {})[new_order_id] = {
+        "order_id": new_order_id,
+        "name": state["order"]["name"],
+        "items": [],
+        "total": Decimal("0.00"),
+        "currency": DEFAULT_CURRENCY,
+        "payment_status": "pending",
+        "payment_method": "",
+        "order_stage": "none",
+        "customer_profile": deepcopy(state.get("customer_profile", {})),
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "confirmed_at": None,
+    }
+    return new_order_id
+
+
+def get_order_record(state: Dict[str, Any], order_id: str) -> Optional[Dict[str, Any]]:
+    if not order_id:
+        return None
+    if state.get("active_order_id") == order_id:
+        sync_active_order_record(state)
+    return state.get("orders", {}).get(order_id)
+
+
+def extract_order_id(text: str) -> Optional[str]:
+    match = re.search(r"\bAGN-\d{4}-\d{4}\b", text.upper())
+    return match.group(0) if match else None
 
 
 def normalize_text(text: str) -> str:
@@ -380,6 +489,9 @@ def generate_order_summary(order: Dict[str, Any], state: Optional[Dict[str, Any]
             ],
         )
     lines = [intro, ""]
+    if order.get("order_id"):
+        lines.append(f"Order ID: {order['order_id']}")
+        lines.append("")
     if state is None:
         detail_style = 0
     else:
@@ -432,6 +544,8 @@ def generate_final_order_summary(state: Dict[str, Any]) -> str:
     }.get(state.get("payment_method", ""), "Pending")
 
     lines = [header, ""]
+    if order.get("order_id"):
+        lines.append(f"Order ID: {order['order_id']}")
     if profile.get("name"):
         lines.append(f"Name: {profile['name']}")
     if profile.get("mobile"):
@@ -471,6 +585,36 @@ def generate_final_order_summary(state: Dict[str, Any]) -> str:
             f"Order Status: {state.get('order_stage', 'none').title()}",
         ]
     )
+    return "\n".join(lines)
+
+
+def refresh_order_record_stage(record: Dict[str, Any]) -> None:
+    confirmed_at = record.get("confirmed_at")
+    if not confirmed_at or record.get("order_stage") == "served":
+        return
+    elapsed = utc_now() - confirmed_at
+    if elapsed >= timedelta(minutes=ORDER_PREP_MINUTES):
+        record["order_stage"] = "served"
+    elif elapsed >= timedelta(minutes=1):
+        record["order_stage"] = "preparing"
+
+
+def generate_tracked_order_summary(record: Dict[str, Any], state: Dict[str, Any]) -> str:
+    refresh_order_record_stage(record)
+    currency = record.get("currency", DEFAULT_CURRENCY)
+    lines = [f"Tracking details for {record.get('order_id', 'your order')}:", ""]
+    profile = record.get("customer_profile", {})
+    if profile.get("name"):
+        lines.append(f"Name: {profile['name']}")
+    lines.append(f"Order ID: {record.get('order_id', '')}")
+    lines.append(f"Payment: {record.get('payment_method', '').replace('_', ' ').title() or 'Pending'}")
+    lines.append(f"Status: {record.get('order_stage', 'none').title()}")
+    lines.append("")
+    lines.append("Items:")
+    for item in record.get("items", []):
+        lines.append(f"- {item['name']} x{item['qty']} | {money_to_text(item['price'], currency)}")
+    lines.append("")
+    lines.append(f"Total: {money_to_text(record.get('total', Decimal('0.00')), currency)}")
     return "\n".join(lines)
 
 
@@ -701,18 +845,27 @@ def refresh_order_stage(state: Dict[str, Any]) -> None:
 
 def check_order_stage_message(state: Dict[str, Any]) -> str:
     refresh_order_stage(state)
+    active_id = state.get("active_order_id") or state.get("last_completed_order_id")
     if state["order_stage"] == "none":
         return "I don\u2019t have an active order yet. Send your checkout here and I\u2019ll take it from there."
     if state["order_stage"] == "preparing":
-        return "Update \U0001f60c\n\nYour order is currently being prepared in the kitchen."
-    return "Your order is ready and has been served \U0001f37d\ufe0f\n\nEnjoy your meal."
+        order_line = f"\nOrder ID: {active_id}" if active_id else ""
+        return f"Update \U0001f60c\n\nYour order is currently being prepared in the kitchen.{order_line}"
+    order_line = f"\nOrder ID: {active_id}" if active_id else ""
+    return f"Your order is ready and has been served \U0001f37d\ufe0f\n\nEnjoy your meal.{order_line}"
 
 
 def infer_intent_rule(text: str, state: Dict[str, Any]) -> str:
     lowered = text.lower().strip()
+    if extract_order_id(text):
+        return "track_specific_order"
     if detect_order_message(text):
         return "order_checkout"
-    if lowered in {"1", "order", "order food"} and state["stage"] == STAGE_MAIN_MENU:
+    if lowered in {"1", "order", "order food", "new order", "order again", "another order"} and state["stage"] in {
+        STAGE_MAIN_MENU,
+        STAGE_PREPARING,
+        STAGE_SERVED,
+    }:
         return "order_start"
     if lowered in {"2", "book a table", "table", "reservation"} and state["stage"] == STAGE_MAIN_MENU:
         return "reservation"
@@ -819,6 +972,9 @@ def finalize_confirmation(state: Dict[str, Any]) -> None:
     state["waiting_for_order"] = False
     state["failure_count"] = 0
     state["payment_pending_since"] = None
+    if state.get("active_order_id"):
+        state["last_completed_order_id"] = state["active_order_id"]
+    sync_active_order_record(state)
 
 
 def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any], user_text: str) -> str:
@@ -833,6 +989,8 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
         return greeting_message_for_state(state)
     if action == "show_menu_link":
         state["intent"] = "order"
+        if not state.get("active_order_id") or state.get("payment_status") == "done" or state.get("order_stage") in {"preparing", "served"}:
+            start_new_order(state, user_id)
         set_stage(state, STAGE_CHECKOUT)
         state["waiting_for_order"] = True
         state["checkout_mode"] = "fresh"
@@ -1025,6 +1183,12 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         return mark_handoff(state)
     if intent == "order_start":
         return execute_action(user_id, state, {"action": "show_menu_link"}, text)
+    if intent == "track_specific_order":
+        order_id = extract_order_id(text)
+        record = get_order_record(state, order_id or "")
+        if not record:
+            return "I couldn’t find that order ID. Please check it and send it again."
+        return generate_tracked_order_summary(record, state)
     if intent == "reservation":
         return execute_action(user_id, state, {"action": "book_table"}, text)
     if intent == "reservation_check":
@@ -1143,10 +1307,13 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         if not parsed:
             state["failure_count"] += 1
             return "I couldn\u2019t read that order clearly. Please resend it in the checkout format with name, items, and total."
+        if not state.get("active_order_id") or state.get("payment_status") == "done" or state.get("order_stage") in {"preparing", "served"}:
+            start_new_order(state, user_id)
         state["intent"] = "order"
         state["waiting_for_order"] = False
         if state.get("checkout_mode") == "replace":
             state["order"] = {
+                "order_id": state.get("active_order_id", state.get("order", {}).get("order_id", "")),
                 "name": parsed.get("name", ""),
                 "items": parsed.get("items", []),
                 "total": parsed.get("total", Decimal("0.00")),
@@ -1154,17 +1321,19 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
             }
         else:
             state["order"] = merge_orders(state["order"], parsed)
+            state["order"]["order_id"] = state.get("active_order_id", state["order"].get("order_id", ""))
         update_customer_profile(state, parsed.get("profile", {}))
+        state["order"]["name"] = state.get("customer_profile", {}).get("name", state["order"].get("name", ""))
         state["order_confirmed"] = False
         state["payment_status"] = "pending"
         state["payment_method"] = ""
         state["payment_link"] = ""
         state["payment_link_id"] = ""
         state["payment_verification_attempts"] = 0
-        state["order_sequence"] = int(state.get("order_sequence", 0)) + 1
         state["checkout_mode"] = "append"
         set_stage(state, STAGE_ORDER_ACTION)
         state["failure_count"] = 0
+        sync_active_order_record(state)
         append_sheet_log(user_id, state, "order_updated")
         return generate_order_summary(state["order"], state)
     if state["stage"] in {STAGE_RESERVATION_DETAILS, STAGE_RESERVATION_CHECK}:

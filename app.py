@@ -168,17 +168,29 @@ def initialize_google_sheets_client() -> Optional[gspread.Client]:
         return None
 
 
+def get_google_sheets_client() -> Optional[gspread.Client]:
+    global google_sheets_client
+    if google_sheets_client is not None:
+        return google_sheets_client
+    with google_sheets_lock:
+        if google_sheets_client is None:
+            logger.info("Retrying Google Sheets client initialization on demand.")
+            google_sheets_client = initialize_google_sheets_client()
+    return google_sheets_client
+
+
 google_sheets_client = initialize_google_sheets_client()
 
 
 def log_google_sheets_status() -> None:
     if not GOOGLE_SHEETS_SPREADSHEET_ID:
         return
-    if not google_sheets_client:
+    client = get_google_sheets_client()
+    if not client:
         logger.warning("Google Sheets startup check skipped: client is unavailable.")
         return
     try:
-        spreadsheet = google_sheets_client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
+        spreadsheet = client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
         worksheet_titles = [worksheet.title for worksheet in spreadsheet.worksheets()]
         logger.info(
             "Google Sheets startup check passed: spreadsheet='%s', worksheets=%s",
@@ -946,11 +958,12 @@ def get_or_create_google_worksheet(sheet_name: str) -> Optional[gspread.Workshee
     if not GOOGLE_SHEETS_SPREADSHEET_ID:
         logger.warning("Google Sheets append skipped: GOOGLE_SHEETS_SPREADSHEET_ID is not configured.")
         return None
-    if not google_sheets_client:
+    client = get_google_sheets_client()
+    if not client:
         logger.warning("Google Sheets append skipped: client is unavailable. Check service-account credentials.")
         return None
     try:
-        spreadsheet = google_sheets_client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
+        spreadsheet = client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
         try:
             return spreadsheet.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
@@ -967,6 +980,7 @@ def append_google_sheet_row(sheet_name: str, row: List[str]) -> None:
     try:
         with google_sheets_lock:
             worksheet.append_row(row, value_input_option="USER_ENTERED")
+        logger.info("Google Sheets append succeeded: sheet=%s, first_cell=%s", sheet_name, row[0] if row else "")
     except Exception as exc:
         logger.warning("Google Sheets append failed: %s", exc)
 

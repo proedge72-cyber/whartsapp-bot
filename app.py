@@ -559,6 +559,9 @@ def serialize_state(state: Dict[str, Any]) -> Dict[str, Any]:
         item["price"] = str(item["price"])
     for order_id, record in safe.get("orders", {}).items():
         record["total"] = str(record.get("total", "0.00"))
+        record_insights = record.get("customer_profile", {}).get("insights", {})
+        if "avg_order_value" in record_insights:
+            record_insights["avg_order_value"] = str(record_insights.get("avg_order_value", "0.00"))
         for item in record.get("items", []):
             item["price"] = str(item["price"])
         for key in ("created_at", "updated_at", "confirmed_at"):
@@ -580,6 +583,9 @@ def deserialize_state(state_json: str) -> Dict[str, Any]:
         item["price"] = Decimal(item.get("price", "0.00"))
     for order_id, record in state.get("orders", {}).items():
         record["total"] = Decimal(record.get("total", "0.00"))
+        record_insights = record.get("customer_profile", {}).get("insights", {})
+        if "avg_order_value" in record_insights:
+            record_insights["avg_order_value"] = Decimal(str(record_insights.get("avg_order_value", "0.00")))
         for item in record.get("items", []):
             item["price"] = Decimal(item.get("price", "0.00"))
         for key in ("created_at", "updated_at", "confirmed_at"):

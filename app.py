@@ -52,6 +52,9 @@ GOOGLE_SHEETS_EVENT_SHEET = os.getenv("GOOGLE_SHEETS_EVENT_SHEET", "Events")
 GOOGLE_SHEETS_ORDER_SHEET = os.getenv("GOOGLE_SHEETS_ORDER_SHEET", "Orders")
 GOOGLE_SHEETS_RESERVATION_SHEET = os.getenv("GOOGLE_SHEETS_RESERVATION_SHEET", "Reservations")
 HUMAN_HANDOFF_CONTACT = os.getenv("HUMAN_HANDOFF_CONTACT", "")
+ADMIN_ALERT_WEBHOOK_URL = os.getenv("ADMIN_ALERT_WEBHOOK_URL", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -324,6 +327,20 @@ def initialize_db() -> None:
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 used_at TEXT
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS system_failures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                error_type TEXT NOT NULL,
+                error_message TEXT NOT NULL,
+                critical INTEGER NOT NULL DEFAULT 0,
+                extra_json TEXT NOT NULL
             )
             """
         )
@@ -710,6 +727,7 @@ def create_default_state() -> Dict[str, Any]:
         "last_error_type": "",
         "sync_pending": False,
         "pending_sheet_sync": None,
+        "last_successful_step": "",
         "last_ai_action": "",
         "pending_suggested_item": "",
         "recent_suggestions": [],
@@ -817,6 +835,8 @@ def get_state(user_id: str) -> Dict[str, Any]:
         state["sync_pending"] = False
     if "pending_sheet_sync" not in state:
         state["pending_sheet_sync"] = None
+    if "last_successful_step" not in state:
+        state["last_successful_step"] = ""
     profile = state.setdefault("customer_profile", {})
     profile.setdefault("insights", {})
     profile["insights"].setdefault("favorite_items", [])
@@ -915,7 +935,91 @@ def build_order_sheet_row(user_id: str, state: Dict[str, Any], event_type: str, 
     ]
 
 
-def safe_execute(func: Any, retries: int = 2, delay: int = 1) -> Any:
+def send_admin_alert_async(payload: Dict[str, Any]) -> None:
+    if not ADMIN_ALERT_WEBHOOK_URL and not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+
+    def _send() -> None:
+        try:
+            if ADMIN_ALERT_WEBHOOK_URL:
+                requests.post(ADMIN_ALERT_WEBHOOK_URL, json=payload, timeout=15)
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                message_lines = [
+                    "Agnikara Critical Alert",
+                    f"Time: {payload.get('created_at', '')}",
+                    f"User ID: {payload.get('user_id', '') or 'unknown'}",
+                    f"Action: {payload.get('action', '') or 'unknown'}",
+                    f"Error Type: {payload.get('error_type', '')}",
+                ]
+                error_message = str(payload.get("error_message", "")).strip()
+                if error_message:
+                    message_lines.append(f"Error: {error_message[:800]}")
+                extra = payload.get("extra") or {}
+                last_step = str(extra.get("last_successful_step", "")).strip()
+                if last_step:
+                    message_lines.append(f"Last Successful Step: {last_step}")
+                requests.post(
+                    telegram_url,
+                    json={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": "\n".join(message_lines),
+                    },
+                    timeout=15,
+                )
+        except Exception as exc:
+            logger.warning("Admin alert failed: %s", exc)
+
+    worker = threading.Thread(target=_send, daemon=True)
+    worker.start()
+
+
+def log_system_failure(
+    error_type: str,
+    user_id: str = "",
+    action: str = "",
+    error: Optional[Exception] = None,
+    critical: bool = False,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    timestamp = utc_now().isoformat()
+    error_message = str(error) if error else ""
+    payload = {
+        "created_at": timestamp,
+        "user_id": user_id,
+        "action": action,
+        "error_type": error_type,
+        "error_message": error_message,
+        "critical": bool(critical),
+        "extra": extra or {},
+    }
+    logger.warning("System failure logged: %s", payload)
+    with db_lock:
+        db.execute(
+            """
+            INSERT INTO system_failures (created_at, user_id, action, error_type, error_message, critical, extra_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                timestamp,
+                user_id,
+                action,
+                error_type,
+                error_message,
+                1 if critical else 0,
+                json.dumps(extra or {}),
+            ),
+        )
+        db.commit()
+    if critical:
+        send_admin_alert_async(payload)
+
+
+def safe_execute(func: Any, retries: int = 3, delay: int = 1) -> Any:
+    backoff_schedule = [1, 3, 7]
+    if delay != 1:
+        backoff_schedule[0] = delay
+
     for attempt in range(retries + 1):
         try:
             return func()
@@ -923,13 +1027,35 @@ def safe_execute(func: Any, retries: int = 2, delay: int = 1) -> Any:
             logger.warning("safe_execute attempt %s failed: %s", attempt + 1, exc)
             if attempt >= retries:
                 return None
-            time.sleep(delay)
+            wait_seconds = backoff_schedule[min(attempt, len(backoff_schedule) - 1)]
+            logger.info("Retrying in %s second(s).", wait_seconds)
+            time.sleep(wait_seconds)
     return None
 
 
-def record_failure(state: Dict[str, Any], error_type: str) -> None:
+def mark_successful_step(state: Dict[str, Any], step: str) -> None:
+    state["last_successful_step"] = step
+
+
+def record_failure(
+    state: Dict[str, Any],
+    error_type: str,
+    user_id: str = "",
+    action: str = "",
+    error: Optional[Exception] = None,
+    critical: bool = False,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
     state["failure_count"] = int(state.get("failure_count", 0)) + 1
     state["last_error_type"] = error_type
+    log_system_failure(
+        error_type,
+        user_id=user_id,
+        action=action or state.get("stage", ""),
+        error=error,
+        critical=critical or state["failure_count"] >= 3,
+        extra=extra or {"last_successful_step": state.get("last_successful_step", "")},
+    )
 
 
 def clear_failure(state: Dict[str, Any], error_type: str = "") -> None:
@@ -1080,7 +1206,7 @@ def persist_confirmed_order_async(user_id: str, state_snapshot: Dict[str, Any], 
     logger.warning("Confirmed order save failed after retries for %s", user_id)
     failed_state = get_state(user_id)
     mark_sheet_sync_pending(failed_state, GOOGLE_SHEETS_ORDER_SHEET, user_id=user_id, event_type="order_confirmed")
-    record_failure(failed_state, "google_sheets")
+    record_failure(failed_state, "google_sheets", user_id=user_id, action="persist_confirmed_order_async")
     save_state(user_id, failed_state)
     schedule_pending_sheet_sync(user_id)
     logger.warning("Order confirmed for %s, but Google Sheets sync is pending.", user_id)
@@ -1097,11 +1223,11 @@ def confirm_order_and_store(user_id: str, state: Dict[str, Any]) -> Optional[str
     except Exception as exc:
         logger.warning("Confirmed order save failed: %s", exc)
         mark_sheet_sync_pending(state, GOOGLE_SHEETS_ORDER_SHEET, user_id=user_id, event_type="order_confirmed")
-        record_failure(state, "google_sheets")
+        record_failure(state, "google_sheets", user_id=user_id, action="confirm_order_and_store", error=exc)
         schedule_pending_sheet_sync(user_id)
         if state.get("failure_count", 0) >= 3:
             return mark_handoff(state)
-        return "Something went wrong, but I’ve fixed it. Please try again."
+        return "I’ve saved your order safely. The confirmation is still being secured in the background."
 
     finalize_confirmation(state)
     state_snapshot = deepcopy(state)
@@ -1651,6 +1777,7 @@ def load_order_from_token_payload(user_id: str, state: Dict[str, Any], payload: 
     state["payment_verification_attempts"] = 0
     set_stage(state, STAGE_ORDER_ACTION)
     state["failure_count"] = 0
+    mark_successful_step(state, "order_token_loaded")
     sync_active_order_record(state)
     append_sheet_log(user_id, state, "order_token_loaded")
     if should_merge:
@@ -2609,6 +2736,7 @@ def send_whatsapp_message(to: str, body: str, max_words: int = 80) -> None:
     result = safe_execute(_send, retries=1, delay=1)
     if result is None:
         logger.warning("WhatsApp send failed after retry for %s", to)
+        log_system_failure("whatsapp_send", user_id=to, action="send_whatsapp_message", critical=True)
 
 
 def append_sheet_log(user_id: str, state: Dict[str, Any], event_type: str) -> None:
@@ -2650,6 +2778,7 @@ def append_sheet_log(user_id: str, state: Dict[str, Any], event_type: str) -> No
         requests.post(SHEET_WEBHOOK_URL, json=payload, timeout=15)
     except requests.RequestException as exc:
         logger.warning("Sheet webhook failed: %s", exc)
+        log_system_failure("sheet_webhook", user_id=user_id, action=event_type, error=exc)
 
 
 def generate_payment_link(user_id: str, state: Dict[str, Any]) -> str:
@@ -2686,6 +2815,7 @@ def generate_payment_link(user_id: str, state: Dict[str, Any]) -> str:
     data = safe_execute(_create_link, retries=2, delay=1)
     if data is None:
         state["last_error_type"] = "payment_link"
+        record_failure(state, "payment_link", user_id=user_id, action="generate_payment_link")
         return "Payment link unavailable."
     state["payment_link"] = data.get("short_url", "")
     state["payment_link_id"] = data.get("id", "")
@@ -2709,6 +2839,7 @@ def verify_online_payment(state: Dict[str, Any]) -> bool:
     data = safe_execute(_verify, retries=2, delay=1)
     if data is None:
         state["last_error_type"] = "payment_verification"
+        log_system_failure("payment_verification", action="verify_online_payment")
         return False
     status = str(data.get("status", "")).lower()
     payments = data.get("payments") or []
@@ -2734,6 +2865,7 @@ def save_reservation_record(user_id: str, details: Dict[str, Any]) -> None:
     if result is None:
         state = get_state(user_id)
         mark_sheet_sync_pending(state, GOOGLE_SHEETS_RESERVATION_SHEET, row=reservation_row, user_id=user_id, event_type="reservation_sync")
+        record_failure(state, "google_sheets", user_id=user_id, action="save_reservation_record")
         save_state(user_id, state)
         schedule_pending_sheet_sync(user_id)
 
@@ -2836,6 +2968,7 @@ def set_stage(state: Dict[str, Any], stage: str) -> None:
         state["previous_stage"] = current
         state["stage"] = stage
         state["stage_updated_at"] = utc_now()
+        mark_successful_step(state, f"stage:{stage}")
 
 
 def choose_variant(state: Dict[str, Any], key: str, options: List[str]) -> str:
@@ -3097,6 +3230,7 @@ def finalize_confirmation(state: Dict[str, Any]) -> None:
     if state.get("active_order_id"):
         state["last_completed_order_id"] = state["active_order_id"]
     learn_from_confirmed_order(state)
+    mark_successful_step(state, "order_confirmed")
     sync_active_order_record(state)
 
 
@@ -3203,11 +3337,15 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
         state["failure_count"] = 0
         link = generate_payment_link(user_id, state)
         if link == "Payment link unavailable.":
-            record_failure(state, "payment_link")
             set_stage(state, STAGE_PAYMENT_CHOICE)
             if state.get("failure_count", 0) >= 3:
                 return mark_handoff(state)
-            return "Online payment is unavailable right now. Please choose 1 or 2."
+            return (
+                "It looks like the payment link is not ready yet. No worries — "
+                "you can try again or choose another payment method.\n\n"
+                "1. Try Online Payment Again\n"
+                "2. Pay at Counter"
+            )
         return choose_variant(
             state,
             "payment_link",
@@ -3227,7 +3365,7 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
                 return error_message
             return payment_success_message(state)
         if state.get("last_error_type") == "payment_verification":
-            record_failure(state, "payment_verification")
+            record_failure(state, "payment_verification", user_id=user_id, action="check_payment_status")
             if state.get("failure_count", 0) >= 3:
                 return mark_handoff(state)
             state["payment_method"] = "counter"
@@ -3268,7 +3406,11 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
         if error_message:
             return error_message
         cancel_payment_followup(user_id, state.get("active_order_id", ""))
-        return payment_counter_fallback_message(state)
+        return (
+            "It looks like the payment didn’t go through in time. No worries — "
+            "I’ve saved your order safely and switched it to counter payment.\n\n"
+            f"{generate_final_order_summary(state)}"
+        )
     if action == "pay_at_counter":
         state["payment_method"] = "counter"
         state["failure_count"] = 0
@@ -3349,10 +3491,10 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
     if intent == "order_validation":
         parsed_items = safe_execute(lambda: parse_order(text), retries=2, delay=1)
         if parsed_items is None:
-            record_failure(state, "order_parsing")
+            record_failure(state, "order_parsing", user_id=user_id, action="parse_order")
             if state.get("failure_count", 0) >= 3:
                 return mark_handoff(state)
-            return "I couldn’t understand your order.\nPlease send items like:\n2x Butter Chicken - €10"
+            return "Just a moment - I'm securing your order details. Please send items like:\n2x Butter Chicken - EUR10"
         validated = validate_order(parsed_items)
         corrected_items = validated["corrected_items"]
         if not corrected_items:
@@ -3447,6 +3589,7 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
                 )
         except requests.RequestException as exc:
             logger.warning("Payment verification failed: %s", exc)
+            log_system_failure("payment_verification", user_id=user_id, action="payment_claim", error=exc)
         if state.get("payment_method") != "online":
             return choose_variant(
                 state,
@@ -3513,7 +3656,8 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         parsed = parse_order_message(text)
         if not parsed:
             state["failure_count"] += 1
-            return "I couldn\u2019t read that order clearly. Please resend it in the checkout format with name, items, and total."
+            log_system_failure("order_checkout_parse", user_id=user_id, action="order_checkout")
+            return "Just a moment - I'm securing your order details. Please resend the checkout with name, items, and total."
         if not state.get("active_order_id") or state.get("payment_status") == "done" or state.get("order_stage") in {"preparing", "served"}:
             start_new_order(state, user_id)
         state["intent"] = "order"

@@ -1429,7 +1429,7 @@ def suggest_items(context: Dict[str, Any], current_order: Dict[str, Any]) -> Lis
     return [suggestion["message"] for suggestion in get_structured_suggestions(context, current_order)]
 
 
-def get_structured_suggestions(context: Dict[str, Any], current_order: Dict[str, Any]) -> List[Dict[str, str]]:
+def build_rule_based_suggestion_candidates(context: Dict[str, Any], current_order: Dict[str, Any]) -> List[Dict[str, str]]:
     items = current_order.get("items", [])
     if not items:
         return []
@@ -1501,7 +1501,60 @@ def get_structured_suggestions(context: Dict[str, Any], current_order: Dict[str,
             ranked_suggestions.append(candidate)
             seen_items.add(item_name)
             break
-    return ranked_suggestions[:2]
+    return ranked_suggestions[:3]
+
+
+def ai_select_menu_suggestion(context: Dict[str, Any], current_order: Dict[str, Any], candidates: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    if not openai_client or not candidates:
+        return None
+    payload = {
+        "current_items": [item.get("name", "") for item in current_order.get("items", [])],
+        "favorite_items": context.get("most_frequent_items", []),
+        "preferences": context.get("user_preferences", {}),
+        "candidates": [{"item_name": candidate["item_name"]} for candidate in candidates],
+    }
+    system_prompt = (
+        "Choose the single best menu suggestion for this restaurant order. "
+        "Return only valid JSON with schema "
+        '{"item_name":"string","message":"string"}. '
+        "Use only one candidate item_name from the provided candidates. "
+        "The message should feel warm, natural, and specifically matched to the order. "
+        "Do not mention prices. Do not invent menu items."
+    )
+    try:
+        response = openai_client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": f"Context: {json.dumps(payload, default=str)}"},
+                {"role": "user", "content": "Pick the best matching suggestion for this order."},
+            ],
+            max_output_tokens=120,
+        )
+        parsed = json_from_text(response.output_text) or {}
+        item_name = str(parsed.get("item_name", "")).strip()
+        if not item_name:
+            return None
+        for candidate in candidates:
+            if candidate["item_name"] == item_name:
+                message = str(parsed.get("message", "")).strip()
+                if not message:
+                    return candidate
+                return {"item_name": candidate["item_name"], "message": message}
+    except Exception as exc:
+        logger.warning("AI menu suggestion selection failed: %s", exc)
+    return None
+
+
+def get_structured_suggestions(context: Dict[str, Any], current_order: Dict[str, Any]) -> List[Dict[str, str]]:
+    candidates = build_rule_based_suggestion_candidates(context, current_order)
+    if not candidates:
+        return []
+    ai_choice = ai_select_menu_suggestion(context, current_order, candidates)
+    if not ai_choice:
+        return candidates[:2]
+    remaining = [candidate for candidate in candidates if candidate["item_name"] != ai_choice["item_name"]]
+    return [ai_choice] + remaining[:1]
 
 
 def add_menu_item_to_current_order(state: Dict[str, Any], item_name: str, qty: int = 1) -> bool:
@@ -1538,20 +1591,46 @@ def remember_suggested_item(state: Dict[str, Any], item_name: str) -> None:
     state["pending_suggested_item"] = item_name
 
 
+def ai_match_suggested_item_reply(message: str, suggested_item: str) -> bool:
+    if not openai_client or not suggested_item:
+        return False
+    system_prompt = (
+        "Decide whether the user's message means yes, add, or accept for the pending suggested menu item. "
+        "Return only valid JSON with schema {\"accept\":true|false}. "
+        "Be strict enough to avoid false positives, but accept natural variants and typos."
+    )
+    try:
+        response = openai_client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": f"Pending suggested item: {suggested_item}"},
+                {"role": "user", "content": message},
+            ],
+            max_output_tokens=40,
+        )
+        parsed = json_from_text(response.output_text) or {}
+        return bool(parsed.get("accept"))
+    except Exception as exc:
+        logger.warning("AI suggested-item reply matching failed: %s", exc)
+        return False
+
+
 def maybe_accept_suggested_item(state: Dict[str, Any], message: str) -> Optional[str]:
     suggested_item = state.get("pending_suggested_item", "").strip()
     if not suggested_item or not state.get("order", {}).get("items"):
         return None
     lowered = normalize_text(message).lower()
-    resolved_item = find_menu_item(lowered)
+    explicit_add_item = extract_explicit_add_item(message)
     has_affirmation = bool(re.search(r"\b(yes+|ok|okay|sure|yeah|yep|please|go ahead)\b", lowered))
     has_add_signal = bool(re.search(r"\badd\b", lowered))
     has_reference = (
         bool(re.search(r"\b(it|that|this)\b", lowered))
         or suggested_item.lower() in lowered
-        or (resolved_item is not None and resolved_item.get("name", "") == suggested_item)
+        or explicit_add_item == suggested_item
     )
-    if not ((has_add_signal and has_reference) or (has_affirmation and has_reference) or suggested_item.lower() in lowered):
+    ai_accepts = ai_match_suggested_item_reply(message, suggested_item)
+    if not ((has_add_signal and has_reference) or (has_affirmation and has_reference) or suggested_item.lower() in lowered or ai_accepts):
         return None
     if add_menu_item_to_current_order(state, suggested_item):
         return build_contextual_update_message(state, suggested_item) + "\n\n" + generate_order_summary(state["order"], state)
@@ -1567,6 +1646,14 @@ def extract_explicit_add_item(message: str) -> Optional[str]:
     if candidate in {"it", "that", "this"}:
         return None
     menu_item = find_menu_item(candidate)
+    if menu_item:
+        return menu_item["name"]
+    for page in FIXED_MENU_PAGES.values():
+        for category in page["categories"]:
+            for item in category["items"]:
+                normalized_name = normalize_menu_text(item["name"])
+                if candidate and candidate in normalized_name:
+                    return item["name"]
     return menu_item["name"] if menu_item else None
 
 

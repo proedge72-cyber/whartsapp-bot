@@ -1190,9 +1190,18 @@ def extract_order_token(text: str) -> Optional[str]:
     match = re.search(r"\b[A-Z0-9]{16}\b", upper_text)
     if match:
         return match.group(0)
-    collapsed = re.sub(r"[^A-Z0-9]+", "", upper_text)
-    match = re.search(r"[A-Z0-9]{16}", collapsed)
-    return match.group(0) if match else None
+
+    labeled_match = re.search(
+        r"(?:ORDER\s+TOKEN(?:\s+ID)?|TOKEN(?:\s+ID)?)\s*[:#-]?\s*([A-Z0-9][A-Z0-9\s-]{14,30})",
+        upper_text,
+    )
+    if not labeled_match:
+        return None
+
+    candidate = re.sub(r"[^A-Z0-9]", "", labeled_match.group(1))
+    if len(candidate) != 16:
+        return None
+    return candidate
 
 
 def sorted_order_ids(state: Dict[str, Any]) -> List[str]:

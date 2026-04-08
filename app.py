@@ -514,6 +514,12 @@ def create_default_state() -> Dict[str, Any]:
             "service_type": "",
             "preferred_time": "",
             "guests": "",
+            "insights": {
+                "favorite_items": [],
+                "avg_order_value": Decimal("0.00"),
+                "order_frequency": 0,
+                "preferred_time": "",
+            },
             "preferences": {
                 "item_counts": {},
                 "category_counts": {},
@@ -546,6 +552,9 @@ def create_default_state() -> Dict[str, Any]:
 def serialize_state(state: Dict[str, Any]) -> Dict[str, Any]:
     safe = deepcopy(state)
     safe["order"]["total"] = str(safe["order"]["total"])
+    insights = safe.get("customer_profile", {}).get("insights", {})
+    if "avg_order_value" in insights:
+        insights["avg_order_value"] = str(insights.get("avg_order_value", "0.00"))
     for item in safe["order"]["items"]:
         item["price"] = str(item["price"])
     for order_id, record in safe.get("orders", {}).items():
@@ -564,6 +573,9 @@ def serialize_state(state: Dict[str, Any]) -> Dict[str, Any]:
 def deserialize_state(state_json: str) -> Dict[str, Any]:
     state = json.loads(state_json)
     state["order"]["total"] = Decimal(state["order"].get("total", "0.00"))
+    insights = state.get("customer_profile", {}).get("insights", {})
+    if "avg_order_value" in insights:
+        insights["avg_order_value"] = Decimal(str(insights.get("avg_order_value", "0.00")))
     for item in state["order"]["items"]:
         item["price"] = Decimal(item.get("price", "0.00"))
     for order_id, record in state.get("orders", {}).items():
@@ -623,6 +635,11 @@ def get_state(user_id: str) -> Dict[str, Any]:
     if "recent_suggestions" not in state:
         state["recent_suggestions"] = []
     profile = state.setdefault("customer_profile", {})
+    profile.setdefault("insights", {})
+    profile["insights"].setdefault("favorite_items", [])
+    profile["insights"].setdefault("avg_order_value", Decimal("0.00"))
+    profile["insights"].setdefault("order_frequency", 0)
+    profile["insights"].setdefault("preferred_time", "")
     profile.setdefault("preferences", {})
     profile["preferences"].setdefault("item_counts", {})
     profile["preferences"].setdefault("category_counts", {})
@@ -1330,6 +1347,56 @@ def get_user_context(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def analyze_customer_behavior(state: Dict[str, Any]) -> Dict[str, Any]:
+    orders = state.get("orders", {})
+    if not orders:
+        return {
+            "favorite_items": [],
+            "avg_order_value": Decimal("0.00"),
+            "order_frequency": 0,
+            "preferred_time": "",
+        }
+
+    item_counts: Dict[str, int] = {}
+    total_value = Decimal("0.00")
+    recent_order_count = 0
+    hour_counts: Dict[int, int] = {}
+    now = utc_now()
+
+    for record in orders.values():
+        record_total = record.get("total", Decimal("0.00"))
+        if isinstance(record_total, Decimal):
+            total_value += record_total
+        confirmed_at = record.get("confirmed_at") or record.get("created_at")
+        if confirmed_at:
+            if now - confirmed_at <= timedelta(days=7):
+                recent_order_count += 1
+            hour_counts[confirmed_at.hour] = hour_counts.get(confirmed_at.hour, 0) + 1
+        for item in record.get("items", []):
+            item_name = item.get("name", "")
+            if not item_name:
+                continue
+            item_counts[item_name] = item_counts.get(item_name, 0) + int(item.get("qty", 0) or 0)
+
+    favorite_items = [
+        item_name
+        for item_name, _ in sorted(item_counts.items(), key=lambda pair: (-pair[1], pair[0]))[:3]
+    ]
+    avg_order_value = (total_value / Decimal(len(orders))).quantize(Decimal("0.01")) if orders else Decimal("0.00")
+
+    preferred_hour = ""
+    if hour_counts:
+        best_hour = sorted(hour_counts.items(), key=lambda pair: (-pair[1], pair[0]))[0][0]
+        preferred_hour = datetime(2000, 1, 1, best_hour, 0).strftime("%I %p").lstrip("0")
+
+    return {
+        "favorite_items": favorite_items,
+        "avg_order_value": avg_order_value,
+        "order_frequency": recent_order_count,
+        "preferred_time": preferred_hour,
+    }
+
+
 def extract_preference_note(message: str) -> str:
     lowered = normalize_text(message).lower()
     known_preferences = [
@@ -1786,6 +1853,7 @@ def learn_from_confirmed_order(state: Dict[str, Any]) -> None:
     preferred_time = state.get("customer_profile", {}).get("preferred_time", "").strip()
     if preferred_time:
         time_slots[preferred_time] = time_slots.get(preferred_time, 0) + 1
+    state.setdefault("customer_profile", {})["insights"] = analyze_customer_behavior(state)
 
 
 def generate_order_summary(order: Dict[str, Any], state: Optional[Dict[str, Any]] = None) -> str:
@@ -2283,6 +2351,10 @@ def greeting_message() -> str:
 
 
 def greeting_message_for_state(state: Dict[str, Any]) -> str:
+    insights = state.get("customer_profile", {}).get("insights", {})
+    favorite_items = insights.get("favorite_items", [])
+    preferred_time = str(insights.get("preferred_time", "")).strip()
+    order_frequency = int(insights.get("order_frequency", 0) or 0)
     opener = choose_variant(
         state,
         "greeting",
@@ -2302,13 +2374,20 @@ def greeting_message_for_state(state: Dict[str, Any]) -> str:
             "What can I help you with today?",
         ],
     )
-    return (
-        f"{opener}\n\n"
-        f"{assist}\n\n"
-        "1. Order Food\n"
-        "2. Book a Table\n"
-        "3. Check Reservation"
-    )
+    lines = [opener]
+    if favorite_items:
+        usual_line = ", ".join(favorite_items[:2])
+        lines.extend(["", f"Welcome back! Want your usual {usual_line} again?"])
+    elif order_frequency > 0:
+        lines.extend(["", "Welcome back. Ready for another order?"])
+    if preferred_time:
+        lines.extend(["", f"You usually order around {preferred_time} 😏"])
+    if favorite_items:
+        lines.extend(["", "Your favorites:", *[f"* {item}" for item in favorite_items[:3]], "Reply YES to reorder instantly."])
+    else:
+        lines.extend(["", assist])
+    lines.extend(["", "1. Order Food", "2. Book a Table", "3. Check Reservation"])
+    return "\n".join(lines)
 
 
 def order_instruction_message(state: Dict[str, Any]) -> str:

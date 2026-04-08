@@ -728,6 +728,7 @@ def create_default_state() -> Dict[str, Any]:
         "sync_pending": False,
         "pending_sheet_sync": None,
         "last_successful_step": "",
+        "preferred_language": "en",
         "last_ai_action": "",
         "pending_suggested_item": "",
         "recent_suggestions": [],
@@ -837,6 +838,8 @@ def get_state(user_id: str) -> Dict[str, Any]:
         state["pending_sheet_sync"] = None
     if "last_successful_step" not in state:
         state["last_successful_step"] = ""
+    if "preferred_language" not in state:
+        state["preferred_language"] = "en"
     profile = state.setdefault("customer_profile", {})
     profile.setdefault("insights", {})
     profile["insights"].setdefault("favorite_items", [])
@@ -1367,6 +1370,73 @@ def resolve_order_reference(state: Dict[str, Any], text: str) -> Optional[str]:
 
 def normalize_text(text: str) -> str:
     return (text or "").strip()
+
+
+def detect_user_language(text: str, state: Optional[Dict[str, Any]] = None) -> str:
+    sample = normalize_text(text)
+    if not sample:
+        return str((state or {}).get("preferred_language", "en") or "en")
+
+    lowered = sample.lower()
+    if re.search(r"[\u0900-\u097F]", sample):
+        return "hi"
+
+    italian_signals = {
+        "ciao", "prenota", "tavolo", "voglio", "vorrei", "ordine", "menu", "grazie",
+        "per favore", "conferma", "aggiungi", "modifica", "pagamento", "conto"
+    }
+    hinglish_signals = {
+        "bhai", "bhaiya", "bro", "sun", "suno", "kr", "kar", "karo", "krdo", "krna",
+        "mera", "meri", "mujhe", "chahiye", "nahi", "haan", "acha", "thik", "theek",
+        "samjho", "sunna", "baat", "table book", "order karna", "kar do"
+    }
+    hindi_signals = {
+        "namaste", "dhanyavaad", "kripya", "aap", "kya", "kyu", "kaise"
+    }
+
+    if any(token in lowered for token in italian_signals):
+        return "it"
+    if any(token in lowered for token in hinglish_signals):
+        return "hinglish"
+    if any(token in lowered for token in hindi_signals):
+        return "hi"
+    return str((state or {}).get("preferred_language", "en") or "en")
+
+
+def localize_reply_text(reply: str, state: Dict[str, Any]) -> str:
+    language = str(state.get("preferred_language", "en") or "en")
+    if language == "en" or not reply.strip():
+        return reply
+    if not openai_client:
+        return reply
+
+    target_label = {
+        "it": "Italian",
+        "hi": "Hindi written in Devanagari script",
+        "hinglish": "Hinglish written in natural Roman Hindi",
+    }.get(language, "English")
+
+    system_prompt = (
+        "Translate the assistant reply into the target language while preserving the structure, numbering, "
+        "menu URLs, order IDs, order tokens, phone numbers, prices, and line breaks exactly when possible. "
+        "Do not translate IDs, URLs, tokens, or numeric values. Keep the tone warm and service-oriented. "
+        "Return only the translated reply."
+    )
+    try:
+        response = openai_client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": f"Target language: {target_label}"},
+                {"role": "user", "content": reply},
+            ],
+            max_output_tokens=min(900, max(180, len(reply.split()) * 3)),
+        )
+        translated = normalize_text(response.output_text)
+        return translated or reply
+    except Exception as exc:
+        logger.warning("Reply localization failed: %s", exc)
+        return reply
 
 
 def money_to_text(value: Decimal, currency: str) -> str:
@@ -3184,12 +3254,14 @@ def json_from_text(text: str) -> Optional[Dict[str, Any]]:
 def ai_decide_action(user_message: str, state: Dict[str, Any]) -> Dict[str, Any]:
     if not openai_client:
         return {"action": "none", "intent": "none"}
+    user_language = detect_user_language(user_message, state)
     system_prompt = (
         "You are Agnikara Restaurant AI. Return only valid JSON. "
         "Choose one action from this set: "
         + ", ".join(sorted(SUPPORTED_ACTIONS))
         + ". Keep replies under 60 words. Never show the full menu in chat. "
         f"If menu is relevant, use this link: {MENU_URL}. "
+        "The user may write in English, Italian, Hindi, or Hinglish, and you must understand their intent correctly. "
         "Never claim payment is received unless the action is check_payment_status. "
         'Schema: {"intent":"string","action":"string","reply":"string","item_name":"string","quantity":0,"needs_handoff":false}.'
     )
@@ -3199,6 +3271,7 @@ def ai_decide_action(user_message: str, state: Dict[str, Any]) -> Dict[str, Any]
             input=[
                 {"role": "system", "content": system_prompt},
                 {"role": "system", "content": f"State: {json.dumps(serialize_state(state))}"},
+                {"role": "system", "content": f"Detected user language: {user_language}"},
                 {"role": "user", "content": user_message},
             ],
             max_output_tokens=180,
@@ -3733,6 +3806,7 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
 def build_reply(user_id: str, text: str) -> str:
     state = get_state(user_id)
     state["last_message_at"] = utc_now()
+    state["preferred_language"] = detect_user_language(text, state)
     refresh_order_stage(state)
     if state.get("sync_pending"):
         schedule_pending_sheet_sync(user_id)
@@ -3741,10 +3815,12 @@ def build_reply(user_id: str, text: str) -> str:
     if order_token:
         payload = consume_any_order_token_record(order_token)
         if not payload:
-            return "I couldn’t open that order token. Please place the order again from the website."
+            reply = "I couldn't open that order token. Please place the order again from the website."
+            save_state(user_id, state)
+            return localize_reply_text(reply, state)
         reply = load_order_from_token_payload(user_id, state, payload)
         save_state(user_id, state)
-        return reply
+        return localize_reply_text(reply, state)
 
     if not state["greeted"]:
         state["greeted"] = True
@@ -3753,33 +3829,33 @@ def build_reply(user_id: str, text: str) -> str:
             initial = greeting_message_for_state(state)
             follow_up = handle_rule_intent(user_id, state, infer_intent_rule(text, state), text) or greeting_message_for_state(state)
             save_state(user_id, state)
-            return f"{initial}\n\n{follow_up}"
+            return localize_reply_text(f"{initial}\n\n{follow_up}", state)
         save_state(user_id, state)
-        return greeting_message_for_state(state)
+        return localize_reply_text(greeting_message_for_state(state), state)
 
     suggestion_reply = maybe_accept_suggested_item(state, text)
     if suggestion_reply:
         state["last_ai_action"] = "accept_suggested_item"
         save_state(user_id, state)
-        return suggestion_reply
+        return localize_reply_text(suggestion_reply, state)
 
     lowered = text.strip().lower()
     if lowered == "yes" and state.get("last_ai_action") == "reorder_last":
         if load_last_order_into_cart(state, user_id):
             save_state(user_id, state)
-            return generate_order_summary(state["order"], state)
+            return localize_reply_text(generate_order_summary(state["order"], state), state)
     if lowered == "modify" and state.get("last_ai_action") == "reorder_last":
         if load_last_order_into_cart(state, user_id):
             set_stage(state, STAGE_ORDER_ACTION)
             save_state(user_id, state)
-            return "I’ve loaded your last order. Tell me the change in one line."
+            return localize_reply_text("I've loaded your last order. Tell me the change in one line.", state)
 
     context_intent = detect_intent_with_context(text, state)
     context_reply = handle_context_intent(user_id, state, text, context_intent)
     if context_reply:
         state["last_ai_action"] = context_intent.get("intent", "")
         save_state(user_id, state)
-        return context_reply
+        return localize_reply_text(context_reply, state)
 
     decision = classify_intent(text, state)
     state["last_ai_action"] = decision.get("action", "")
@@ -3787,7 +3863,7 @@ def build_reply(user_id: str, text: str) -> str:
     if reply is None:
         reply = execute_action(user_id, state, decision, text)
     save_state(user_id, state)
-    return reply
+    return localize_reply_text(reply, state)
 
 
 def extract_message_payload(payload: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:

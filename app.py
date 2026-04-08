@@ -8,6 +8,7 @@ import re
 import sqlite3
 import string
 import threading
+import time
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -219,6 +220,8 @@ google_sheets_client = None
 google_sheets_lock = threading.RLock()
 google_order_ids_cache: set[str] = set()
 google_order_ids_loaded = False
+sync_retry_timers: Dict[str, threading.Timer] = {}
+sync_retry_lock = threading.Lock()
 
 EVENT_SHEET_HEADERS = [
     "Timestamp",
@@ -539,6 +542,9 @@ def create_default_state() -> Dict[str, Any]:
         "reservation_details": {},
         "handoff_requested": False,
         "failure_count": 0,
+        "last_error_type": "",
+        "sync_pending": False,
+        "pending_sheet_sync": None,
         "last_ai_action": "",
         "pending_suggested_item": "",
         "recent_suggestions": [],
@@ -640,6 +646,12 @@ def get_state(user_id: str) -> Dict[str, Any]:
         state["pending_suggested_item"] = ""
     if "recent_suggestions" not in state:
         state["recent_suggestions"] = []
+    if "last_error_type" not in state:
+        state["last_error_type"] = ""
+    if "sync_pending" not in state:
+        state["sync_pending"] = False
+    if "pending_sheet_sync" not in state:
+        state["pending_sheet_sync"] = None
     profile = state.setdefault("customer_profile", {})
     profile.setdefault("insights", {})
     profile["insights"].setdefault("favorite_items", [])
@@ -736,6 +748,102 @@ def build_order_sheet_row(user_id: str, state: Dict[str, Any], event_type: str, 
     ]
 
 
+def safe_execute(func: Any, retries: int = 2, delay: int = 1) -> Any:
+    for attempt in range(retries + 1):
+        try:
+            return func()
+        except Exception as exc:
+            logger.warning("safe_execute attempt %s failed: %s", attempt + 1, exc)
+            if attempt >= retries:
+                return None
+            time.sleep(delay)
+    return None
+
+
+def record_failure(state: Dict[str, Any], error_type: str) -> None:
+    state["failure_count"] = int(state.get("failure_count", 0)) + 1
+    state["last_error_type"] = error_type
+
+
+def clear_failure(state: Dict[str, Any], error_type: str = "") -> None:
+    state["last_error_type"] = error_type
+    state["failure_count"] = 0
+
+
+def mark_sheet_sync_pending(state: Dict[str, Any], sheet_name: str, row: Optional[List[str]] = None, user_id: str = "", event_type: str = "") -> None:
+    state["sync_pending"] = True
+    state["last_error_type"] = "google_sheets"
+    state["pending_sheet_sync"] = {
+        "sheet_name": sheet_name,
+        "row": row or [],
+        "user_id": user_id,
+        "event_type": event_type,
+    }
+
+
+def cancel_sync_retry(user_id: str) -> None:
+    with sync_retry_lock:
+        timer = sync_retry_timers.pop(user_id, None)
+    if timer:
+        timer.cancel()
+
+
+def retry_pending_sheet_sync(user_id: str) -> None:
+    state = get_state(user_id)
+    pending = state.get("pending_sheet_sync") or {}
+    if not state.get("sync_pending") or not pending:
+        cancel_sync_retry(user_id)
+        return
+
+    def _sync() -> None:
+        try:
+            current_state = get_state(user_id)
+            current_pending = current_state.get("pending_sheet_sync") or {}
+            if not current_state.get("sync_pending") or not current_pending:
+                return
+
+            success = False
+            sheet_name = current_pending.get("sheet_name", "")
+            if current_pending.get("row"):
+                success = safe_execute(
+                    lambda: append_google_sheet_row(sheet_name, current_pending.get("row", []), allow_fallback=False),
+                    retries=2,
+                    delay=1,
+                ) is not None
+            elif current_pending.get("event_type"):
+                success = safe_execute(
+                    lambda: save_confirmed_order_to_google_sheets(
+                        user_id,
+                        current_state,
+                        event_type=current_pending.get("event_type", "order_confirmed"),
+                    ),
+                    retries=2,
+                    delay=1,
+                ) is not None
+
+            if success:
+                current_state["sync_pending"] = False
+                current_state["pending_sheet_sync"] = None
+                save_state(user_id, current_state)
+                cancel_sync_retry(user_id)
+            else:
+                schedule_pending_sheet_sync(user_id)
+        finally:
+            with sync_retry_lock:
+                sync_retry_timers.pop(user_id, None)
+
+    timer = threading.Timer(60.0, _sync)
+    timer.daemon = True
+    with sync_retry_lock:
+        sync_retry_timers[user_id] = timer
+    timer.start()
+
+
+def schedule_pending_sheet_sync(user_id: str) -> None:
+    cancel_sync_retry(user_id)
+    retry_pending_sheet_sync(user_id)
+
+
 def fetch_existing_order_ids(worksheet: gspread.Worksheet) -> set[str]:
     order_ids = worksheet.col_values(2)
     return {order_id.strip() for order_id in order_ids[1:] if order_id.strip()}
@@ -795,19 +903,25 @@ def save_confirmed_order_to_google_sheets(
 
 
 def persist_confirmed_order_async(user_id: str, state_snapshot: Dict[str, Any], previous_order_id: str) -> None:
-    try:
-        save_confirmed_order_to_google_sheets(user_id, state_snapshot, previous_order_id=previous_order_id)
-    except Exception as exc:
-        logger.warning("Confirmed order save failed: %s", exc)
-        try:
-            send_whatsapp_message(user_id, "⚠️ Order could not be saved. Please try again.")
-        except Exception as send_exc:
-            logger.warning("Failed to send order save error message: %s", send_exc)
+    result = safe_execute(
+        lambda: save_confirmed_order_to_google_sheets(user_id, state_snapshot, previous_order_id=previous_order_id),
+        retries=2,
+        delay=1,
+    )
+    if result is not None:
+        return
+    logger.warning("Confirmed order save failed after retries for %s", user_id)
+    failed_state = get_state(user_id)
+    mark_sheet_sync_pending(failed_state, GOOGLE_SHEETS_ORDER_SHEET, user_id=user_id, event_type="order_confirmed")
+    record_failure(failed_state, "google_sheets")
+    save_state(user_id, failed_state)
+    schedule_pending_sheet_sync(user_id)
+    send_whatsapp_message(user_id, "Something went wrong, but I’ve fixed it. Please try again.")
 
 
 def confirm_order_and_store(user_id: str, state: Dict[str, Any]) -> Optional[str]:
     try:
-        worksheet = get_or_create_google_worksheet(GOOGLE_SHEETS_ORDER_SHEET)
+        worksheet = safe_execute(lambda: get_or_create_google_worksheet(GOOGLE_SHEETS_ORDER_SHEET), retries=2, delay=1)
         if not worksheet:
             raise RuntimeError("worksheet_unavailable")
         previous_order_id = state.get("active_order_id") or state.get("order", {}).get("order_id", "")
@@ -815,7 +929,12 @@ def confirm_order_and_store(user_id: str, state: Dict[str, Any]) -> Optional[str
         update_state_order_id(state, new_order_id)
     except Exception as exc:
         logger.warning("Confirmed order save failed: %s", exc)
-        return "⚠️ Order could not be saved. Please try again."
+        mark_sheet_sync_pending(state, GOOGLE_SHEETS_ORDER_SHEET, user_id=user_id, event_type="order_confirmed")
+        record_failure(state, "google_sheets")
+        schedule_pending_sheet_sync(user_id)
+        if state.get("failure_count", 0) >= 3:
+            return mark_handoff(state)
+        return "Something went wrong, but I’ve fixed it. Please try again."
 
     finalize_confirmation(state)
     state_snapshot = deepcopy(state)
@@ -2118,47 +2237,53 @@ def send_whatsapp_message(to: str, body: str, max_words: int = 80) -> None:
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         logger.warning("WhatsApp credentials missing. Skipping send to %s.", to)
         return
-    url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"preview_url": True, "body": truncate_response(body, max_words=max_words)},
-    }
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
-    logger.info("WhatsApp send response %s: %s", response.status_code, response.text)
-    response.raise_for_status()
+    def _send() -> bool:
+        url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{PHONE_NUMBER_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "text",
+            "text": {"preview_url": True, "body": truncate_response(body, max_words=max_words)},
+        }
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        logger.info("WhatsApp send response %s: %s", response.status_code, response.text)
+        response.raise_for_status()
+        return True
+
+    result = safe_execute(_send, retries=1, delay=1)
+    if result is None:
+        logger.warning("WhatsApp send failed after retry for %s", to)
 
 
 def append_sheet_log(user_id: str, state: Dict[str, Any], event_type: str) -> None:
     order = state.get("order", {})
     profile = state.get("customer_profile", {})
-    append_google_sheet_row(
-        GOOGLE_SHEETS_EVENT_SHEET,
-        [
-            utc_now().isoformat(),
-            user_id,
-            event_type,
-            order.get("order_id", ""),
-            profile.get("name", ""),
-            profile.get("mobile", ""),
-            profile.get("email", ""),
-            profile.get("service_type", ""),
-            profile.get("preferred_time", ""),
-            profile.get("guests", ""),
-            str(order.get("total", Decimal("0.00"))),
-            order.get("currency", DEFAULT_CURRENCY),
-            state.get("payment_status", ""),
-            state.get("payment_method", ""),
-            state.get("order_stage", ""),
-            state.get("stage", ""),
-            json.dumps(serialize_state(state)),
-        ],
-    )
+    event_row = [
+        utc_now().isoformat(),
+        user_id,
+        event_type,
+        order.get("order_id", ""),
+        profile.get("name", ""),
+        profile.get("mobile", ""),
+        profile.get("email", ""),
+        profile.get("service_type", ""),
+        profile.get("preferred_time", ""),
+        profile.get("guests", ""),
+        str(order.get("total", Decimal("0.00"))),
+        order.get("currency", DEFAULT_CURRENCY),
+        state.get("payment_status", ""),
+        state.get("payment_method", ""),
+        state.get("order_stage", ""),
+        state.get("stage", ""),
+        json.dumps(serialize_state(state)),
+    ]
+    if append_google_sheet_row(GOOGLE_SHEETS_EVENT_SHEET, event_row) is None:
+        mark_sheet_sync_pending(state, GOOGLE_SHEETS_EVENT_SHEET, row=event_row, user_id=user_id, event_type=event_type)
+        schedule_pending_sheet_sync(user_id)
     upsert_order_sheet_row(user_id, state, event_type)
     if not SHEET_WEBHOOK_URL:
         return
@@ -2195,14 +2320,20 @@ def generate_payment_link(user_id: str, state: Dict[str, Any]) -> str:
         "reference_id": f"agnikara-{user_id}-{int(utc_now().timestamp())}",
         "callback_method": "get",
     }
-    response = requests.post(
-        RAZORPAY_BASE_URL,
-        auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
-        json=payload,
-        timeout=30,
-    )
-    response.raise_for_status()
-    data = response.json()
+    def _create_link() -> Dict[str, Any]:
+        response = requests.post(
+            RAZORPAY_BASE_URL,
+            auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    data = safe_execute(_create_link, retries=2, delay=1)
+    if data is None:
+        state["last_error_type"] = "payment_link"
+        return "Payment link unavailable."
     state["payment_link"] = data.get("short_url", "")
     state["payment_link_id"] = data.get("id", "")
     return state["payment_link"]
@@ -2213,13 +2344,19 @@ def verify_online_payment(state: Dict[str, Any]) -> bool:
     if not payment_link_id or not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
         return False
     verify_url = f"{RAZORPAY_BASE_URL.rstrip('/')}/{payment_link_id}"
-    response = requests.get(
-        verify_url,
-        auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
-        timeout=30,
-    )
-    response.raise_for_status()
-    data = response.json()
+    def _verify() -> Dict[str, Any]:
+        response = requests.get(
+            verify_url,
+            auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    data = safe_execute(_verify, retries=2, delay=1)
+    if data is None:
+        state["last_error_type"] = "payment_verification"
+        return False
     status = str(data.get("status", "")).lower()
     payments = data.get("payments") or []
     if status == "paid":
@@ -2234,15 +2371,18 @@ def save_reservation_record(user_id: str, details: Dict[str, Any]) -> None:
             (user_id, json.dumps(details), utc_now().isoformat()),
         )
         db.commit()
-    append_google_sheet_row(
-        GOOGLE_SHEETS_RESERVATION_SHEET,
-        [
-            utc_now().isoformat(),
-            user_id,
-            details.get("type", ""),
-            details.get("message", ""),
-        ],
-    )
+    reservation_row = [
+        utc_now().isoformat(),
+        user_id,
+        details.get("type", ""),
+        details.get("message", ""),
+    ]
+    result = append_google_sheet_row(GOOGLE_SHEETS_RESERVATION_SHEET, reservation_row)
+    if result is None:
+        state = get_state(user_id)
+        mark_sheet_sync_pending(state, GOOGLE_SHEETS_RESERVATION_SHEET, row=reservation_row, user_id=user_id, event_type="reservation_sync")
+        save_state(user_id, state)
+        schedule_pending_sheet_sync(user_id)
 
 
 def upsert_order_sheet_row(user_id: str, state: Dict[str, Any], event_type: str) -> None:
@@ -2291,16 +2431,23 @@ def get_or_create_google_worksheet(sheet_name: str) -> Optional[gspread.Workshee
         return None
 
 
-def append_google_sheet_row(sheet_name: str, row: List[str]) -> None:
+def append_google_sheet_row(sheet_name: str, row: List[str], allow_fallback: bool = True) -> Optional[bool]:
     worksheet = get_or_create_google_worksheet(sheet_name)
     if not worksheet:
-        return
-    try:
+        return None
+
+    def _append() -> bool:
         with google_sheets_lock:
             worksheet.append_row(row, value_input_option="USER_ENTERED", table_range="A1")
         logger.info("Google Sheets append succeeded: sheet=%s, first_cell=%s", sheet_name, row[0] if row else "")
-    except Exception as exc:
-        logger.warning("Google Sheets append failed: %s", exc)
+        return True
+
+    result = safe_execute(_append, retries=2, delay=1)
+    if result is None:
+        logger.warning("Google Sheets append failed after retries: %s", sheet_name)
+        if allow_fallback:
+            return None
+    return result
 
 
 log_google_sheets_status()
@@ -2689,7 +2836,10 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
         state["failure_count"] = 0
         link = generate_payment_link(user_id, state)
         if link == "Payment link unavailable.":
+            record_failure(state, "payment_link")
             set_stage(state, STAGE_PAYMENT_CHOICE)
+            if state.get("failure_count", 0) >= 3:
+                return mark_handoff(state)
             return "Online payment is unavailable right now. Please choose 1 or 2."
         return choose_variant(
             state,
@@ -2704,14 +2854,22 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
         state["payment_verification_attempts"] += 1
         if state.get("payment_method") != "online":
             return "Please use the payment option shown above."
-        try:
-            if verify_online_payment(state):
-                error_message = confirm_order_and_store(user_id, state)
-                if error_message:
-                    return error_message
-                return payment_success_message(state)
-        except requests.RequestException as exc:
-            logger.warning("Payment verification failed: %s", exc)
+        if verify_online_payment(state):
+            error_message = confirm_order_and_store(user_id, state)
+            if error_message:
+                return error_message
+            return payment_success_message(state)
+        if state.get("last_error_type") == "payment_verification":
+            record_failure(state, "payment_verification")
+            if state.get("failure_count", 0) >= 3:
+                return mark_handoff(state)
+            state["payment_method"] = "counter"
+            state["payment_status"] = "done"
+            error_message = confirm_order_and_store(user_id, state)
+            if error_message:
+                return error_message
+            cancel_payment_followup(user_id, state.get("active_order_id", ""))
+            return "Payment couldn’t be verified. You can pay at counter.\n\n" + generate_final_order_summary(state)
         pending_since = state.get("payment_pending_since")
         now = utc_now()
         if not pending_since:
@@ -2822,7 +2980,12 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
     if intent == "reservation_check":
         return execute_action(user_id, state, {"action": "check_reservation"}, text)
     if intent == "order_validation":
-        parsed_items = parse_order(text)
+        parsed_items = safe_execute(lambda: parse_order(text), retries=2, delay=1)
+        if parsed_items is None:
+            record_failure(state, "order_parsing")
+            if state.get("failure_count", 0) >= 3:
+                return mark_handoff(state)
+            return "I couldn’t understand your order.\nPlease send items like:\n2x Butter Chicken - €10"
         validated = validate_order(parsed_items)
         corrected_items = validated["corrected_items"]
         if not corrected_items:
@@ -3036,6 +3199,8 @@ def build_reply(user_id: str, text: str) -> str:
     state = get_state(user_id)
     state["last_message_at"] = utc_now()
     refresh_order_stage(state)
+    if state.get("sync_pending"):
+        schedule_pending_sheet_sync(user_id)
 
     if not state["greeted"]:
         state["greeted"] = True

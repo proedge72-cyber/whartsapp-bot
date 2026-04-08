@@ -1088,7 +1088,11 @@ def build_contextual_validated_order_message(validated: Dict[str, Any], total: D
         extra_lines.append(f"{customer_name}, I’ve checked your order against the menu.")
     if modifiers:
         extra_lines.append(f"Saved preferences active: {', '.join(modifiers)}.")
-    if suggestions:
+    structured_suggestions = get_structured_suggestions(get_user_context(state), temp_order)
+    if structured_suggestions:
+        state["pending_suggested_item"] = structured_suggestions[0]["item_name"]
+        extra_lines.append(structured_suggestions[0]["message"])
+    elif suggestions:
         extra_lines.append(suggestions[0])
     if not extra_lines:
         return base_message
@@ -1497,6 +1501,18 @@ def maybe_accept_suggested_item(state: Dict[str, Any], message: str) -> Optional
     return None
 
 
+def extract_explicit_add_item(message: str) -> Optional[str]:
+    lowered = normalize_text(message).lower()
+    match = re.match(r"^(?:please\s+)?add\s+(.+)$", lowered)
+    if not match:
+        return None
+    candidate = match.group(1).strip()
+    if candidate in {"it", "that", "this"}:
+        return None
+    menu_item = find_menu_item(candidate)
+    return menu_item["name"] if menu_item else None
+
+
 def build_contextual_update_message(state: Dict[str, Any], item_name: str) -> str:
     customer_name = state.get("customer_profile", {}).get("name", "").strip()
     favorite_items = get_user_context(state).get("most_frequent_items", [])
@@ -1573,6 +1589,10 @@ def handle_context_intent(user_id: str, state: Dict[str, Any], message: str, con
     intent = context_intent.get("intent", "unknown")
     if state.get("stage") in {STAGE_PAYMENT_CHOICE, STAGE_PAYMENT_CONFIRMATION, STAGE_RESERVATION_DETAILS, STAGE_RESERVATION_CHECK}:
         return None
+    explicit_add_item = extract_explicit_add_item(message)
+    if explicit_add_item and state.get("order", {}).get("items"):
+        if add_menu_item_to_current_order(state, explicit_add_item):
+            return build_contextual_update_message(state, explicit_add_item) + "\n\n" + generate_order_summary(state["order"], state)
     if intent == "greeting" and not state.get("order", {}).get("items"):
         return greeting_message_for_state(state)
     if intent == "reorder_last":
@@ -1674,9 +1694,10 @@ def generate_order_summary(order: Dict[str, Any], state: Optional[Dict[str, Any]
         modifiers = state.get("customer_profile", {}).get("preferences", {}).get("modifiers", [])
         if modifiers:
             lines.extend(["", f"Saved preferences: {', '.join(modifiers)}"])
-        suggestions = suggest_items(get_user_context(state), order)
-        if suggestions:
-            lines.extend(["", suggestions[0]])
+        structured_suggestions = get_structured_suggestions(get_user_context(state), order)
+        if structured_suggestions:
+            state["pending_suggested_item"] = structured_suggestions[0]["item_name"]
+            lines.extend(["", structured_suggestions[0]["message"]])
     lines.extend(
         [
             "",

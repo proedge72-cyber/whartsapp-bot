@@ -3108,21 +3108,18 @@ def check_order_stage_message(state: Dict[str, Any]) -> str:
 
 def infer_intent_rule(text: str, state: Dict[str, Any]) -> str:
     lowered = text.lower().strip()
+    allow_menu_exit = state["stage"] in {STAGE_MAIN_MENU, STAGE_HUMAN_HANDOFF, STAGE_PREPARING, STAGE_SERVED}
     if resolve_order_reference(state, text):
         return "track_specific_order"
     if detect_validatable_order_message(text):
         return "order_validation"
     if detect_order_message(text):
         return "order_checkout"
-    if lowered in {"1", "order", "order food", "new order", "order again", "another order"} and state["stage"] in {
-        STAGE_MAIN_MENU,
-        STAGE_PREPARING,
-        STAGE_SERVED,
-    }:
+    if lowered in {"1", "order", "order food", "new order", "order again", "another order"} and allow_menu_exit:
         return "order_start"
-    if lowered in {"2", "book a table", "table", "reservation"} and state["stage"] == STAGE_MAIN_MENU:
+    if lowered in {"2", "book a table", "table", "reservation", "i want to book a table", "book table"} and allow_menu_exit:
         return "reservation"
-    if lowered in {"3", "check reservation", "reservation check"} and state["stage"] == STAGE_MAIN_MENU:
+    if lowered in {"3", "check reservation", "reservation check", "i want to check reservation"} and allow_menu_exit:
         return "reservation_check"
     if lowered in {"1", "confirm order", "confirm"} and state["stage"] == STAGE_ORDER_ACTION:
         return "confirm_order"
@@ -3153,7 +3150,19 @@ def infer_intent_rule(text: str, state: Dict[str, Any]) -> str:
         return "handoff_to_human"
     if state["stage"] == STAGE_HUMAN_HANDOFF and any(
         phrase in lowered
-        for phrase in {"dont want human", "don't want human", "talk to you", "not human", "stay with you"}
+        for phrase in {
+            "dont want human",
+            "don't want human",
+            "talk to you",
+            "not human",
+            "stay with you",
+            "listen to me",
+            "listen",
+            "continue here",
+            "you help me",
+            "what but why",
+            "what listen to me",
+        }
     ):
         return "cancel_handoff"
     return "none"
@@ -3213,7 +3222,14 @@ def classify_intent(text: str, state: Dict[str, Any]) -> Dict[str, Any]:
 def mark_handoff(state: Dict[str, Any]) -> str:
     state["handoff_requested"] = True
     set_stage(state, STAGE_HUMAN_HANDOFF)
-    return handoff_message()
+    return (
+        f"{handoff_message()}\n\n"
+        "If you'd rather continue with me here, reply:\n"
+        "1. Order Food\n"
+        "2. Book a Table\n"
+        "3. Check Reservation\n"
+        "or say 'talk to you'."
+    )
 
 
 def finalize_confirmation(state: Dict[str, Any]) -> None:
@@ -3477,6 +3493,7 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
     if intent == "handoff_to_human":
         return mark_handoff(state)
     if intent == "order_start":
+        state["handoff_requested"] = False
         return execute_action(user_id, state, {"action": "show_menu_link"}, text)
     if intent == "track_specific_order":
         order_id = resolve_order_reference(state, text)
@@ -3485,8 +3502,10 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
             return "I couldn’t find that order ID. Please check it and send it again."
         return generate_tracked_order_summary(record, state)
     if intent == "reservation":
+        state["handoff_requested"] = False
         return execute_action(user_id, state, {"action": "book_table"}, text)
     if intent == "reservation_check":
+        state["handoff_requested"] = False
         return execute_action(user_id, state, {"action": "check_reservation"}, text)
     if intent == "order_validation":
         parsed_items = safe_execute(lambda: parse_order(text), retries=2, delay=1)

@@ -1083,7 +1083,7 @@ def persist_confirmed_order_async(user_id: str, state_snapshot: Dict[str, Any], 
     record_failure(failed_state, "google_sheets")
     save_state(user_id, failed_state)
     schedule_pending_sheet_sync(user_id)
-    send_whatsapp_message(user_id, "Something went wrong, but I’ve fixed it. Please try again.")
+    logger.warning("Order confirmed for %s, but Google Sheets sync is pending.", user_id)
 
 
 def confirm_order_and_store(user_id: str, state: Dict[str, Any]) -> Optional[str]:
@@ -1596,7 +1596,12 @@ def update_customer_profile(state: Dict[str, Any], profile_data: Dict[str, str])
 
 
 def load_order_from_token_payload(user_id: str, state: Dict[str, Any], payload: Dict[str, Any]) -> str:
-    if not state.get("active_order_id") or state.get("payment_status") == "done" or state.get("order_stage") in {"preparing", "served"}:
+    is_new_order_session = (
+        not state.get("active_order_id")
+        or state.get("payment_status") == "done"
+        or state.get("order_stage") in {"preparing", "served"}
+    )
+    if is_new_order_session:
         start_new_order(state, user_id)
 
     profile = payload.get("profile", {})
@@ -1616,14 +1621,27 @@ def load_order_from_token_payload(user_id: str, state: Dict[str, Any], payload: 
     state["intent"] = "order"
     state["waiting_for_order"] = False
     state["checkout_mode"] = "append"
-    state["order"] = {
-        "order_id": state.get("active_order_id", state.get("order", {}).get("order_id", "")),
-        "order_token": str(payload.get("order_token", "")).strip(),
+    incoming_order = {
         "name": state.get("customer_profile", {}).get("name", profile.get("name", "")),
         "items": normalized_items,
         "total": total,
         "currency": payload.get("currency", DEFAULT_CURRENCY),
     }
+    should_merge = bool(state.get("order", {}).get("items")) and not is_new_order_session
+    if should_merge:
+        state["order"] = merge_orders(state["order"], incoming_order)
+    else:
+        state["order"] = {
+            "order_id": state.get("active_order_id", state.get("order", {}).get("order_id", "")),
+            "order_token": str(payload.get("order_token", "")).strip(),
+            "name": incoming_order["name"],
+            "items": normalized_items,
+            "total": total,
+            "currency": incoming_order["currency"],
+        }
+    state["order"]["order_id"] = state.get("active_order_id", state.get("order", {}).get("order_id", ""))
+    state["order"]["order_token"] = str(payload.get("order_token", "")).strip()
+    state["order"]["name"] = state.get("customer_profile", {}).get("name", profile.get("name", ""))
     apply_saved_preferences_to_order(state)
     state["order_confirmed"] = False
     state["payment_status"] = "pending"
@@ -1635,6 +1653,8 @@ def load_order_from_token_payload(user_id: str, state: Dict[str, Any], payload: 
     state["failure_count"] = 0
     sync_active_order_record(state)
     append_sheet_log(user_id, state, "order_token_loaded")
+    if should_merge:
+        return "I’ve added the items from your new token to your current order.\n\n" + generate_order_summary(state["order"], state)
     return generate_order_summary(state["order"], state)
 
 
@@ -2144,6 +2164,10 @@ def maybe_accept_suggested_item(state: Dict[str, Any], message: str) -> Optional
     if not suggested_item or not state.get("order", {}).get("items"):
         return None
     lowered = normalize_text(message).lower()
+    if lowered == "4":
+        if add_menu_item_to_current_order(state, suggested_item):
+            return build_contextual_update_message(state, suggested_item) + "\n\n" + generate_order_summary(state["order"], state)
+        return None
     explicit_add_item = extract_explicit_add_item(message)
     has_affirmation = bool(re.search(r"\b(yes+|ok|okay|sure|yeah|yep|please|go ahead)\b", lowered))
     has_add_signal = bool(re.search(r"\badd\b", lowered))
@@ -2375,6 +2399,8 @@ def generate_order_summary(order: Dict[str, Any], state: Optional[Dict[str, Any]
             "3. Modify Order",
         ]
     )
+    if state is not None and state.get("pending_suggested_item"):
+        lines.append("4. Add Suggested Item")
     return "\n".join(lines)
 
 
@@ -2979,6 +3005,8 @@ def infer_intent_rule(text: str, state: Dict[str, Any]) -> str:
         return "add_more_items"
     if lowered in {"3", "modify order", "modify"} and state["stage"] == STAGE_ORDER_ACTION:
         return "modify_order"
+    if lowered in {"4", "add suggested item", "suggested item", "add suggestion"} and state["stage"] == STAGE_ORDER_ACTION and state.get("pending_suggested_item"):
+        return "accept_suggested_item"
     if lowered in {"1", "pay online", "online", "online payment"} and state["stage"] == STAGE_PAYMENT_CHOICE:
         return "pay_online"
     if lowered in {"2", "pay at counter", "counter"} and state["stage"] == STAGE_PAYMENT_CHOICE:
@@ -3109,11 +3137,26 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
         set_stage(state, STAGE_PAYMENT_CHOICE)
         state["failure_count"] = 0
         return payment_prompt_message(state)
+    if action == "add_more_items" and state.get("checkout_mode") != "__legacy_add_more__":
+        state["pending_suggested_item"] = ""
+        set_stage(state, STAGE_CHECKOUT)
+        state["waiting_for_order"] = True
+        state["checkout_mode"] = "append"
+        state["failure_count"] = 0
+        return choose_variant(
+            state,
+            "add_more_items_token",
+            [
+                f"Of course.\n\nOpen {MENU_URL}, add the extra items, generate a new order token, and send that token here. I’ll add those items to your current order.",
+                f"Absolutely.\n\nGo to {MENU_URL}, build the extra items, create a fresh token, and share that token here so I can append them to your current order.",
+                f"Sure.\n\nAdd what you’d like on {MENU_URL}, generate another token from the website, and send it here. I’ll merge it into your current order.",
+            ],
+        )
     if action == "add_more_items":
         state["pending_suggested_item"] = ""
         set_stage(state, STAGE_CHECKOUT)
         state["waiting_for_order"] = True
-        state["checkout_mode"] = "replace"
+        state["checkout_mode"] = "append"
         state["failure_count"] = 0
         return choose_variant(
             state,
@@ -3367,6 +3410,11 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         return execute_action(user_id, state, {"action": "add_more_items"}, text)
     if intent == "modify_order":
         return execute_action(user_id, state, {"action": "modify_order"}, text)
+    if intent == "accept_suggested_item":
+        suggestion_reply = maybe_accept_suggested_item(state, "4")
+        if suggestion_reply:
+            return suggestion_reply
+        return "I couldn’t add the suggested item right now. Please try again or add it by name."
     if intent == "pay_online":
         return execute_action(user_id, state, {"action": "send_payment_link"}, text)
     if intent == "pay_at_counter":

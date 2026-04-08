@@ -225,8 +225,8 @@ sync_retry_timers: Dict[str, threading.Timer] = {}
 sync_retry_lock = threading.Lock()
 
 EVENT_SHEET_HEADERS = [
-    "Timestamp",
-    "User ID",
+    "Created At",
+    "Source / User ID",
     "Event Type",
     "Order ID",
     "Order Token",
@@ -234,9 +234,9 @@ EVENT_SHEET_HEADERS = [
     "Mobile",
     "Email",
     "Service Type",
-    "Preferred Time",
+    "Order Time Slot",
     "Guests",
-    "Total",
+    "Order Total",
     "Currency",
     "Payment Status",
     "Payment Method",
@@ -248,15 +248,15 @@ ORDER_SHEET_HEADERS = [
     "Last Updated",
     "Order ID",
     "Order Token",
-    "User ID",
+    "Source / User ID",
     "Customer Name",
     "Mobile",
     "Email",
     "Service Type",
-    "Preferred Time",
+    "Order Time Slot",
     "Guests",
     "Items Summary",
-    "Total",
+    "Order Total",
     "Currency",
     "Payment Status",
     "Payment Method",
@@ -265,8 +265,8 @@ ORDER_SHEET_HEADERS = [
     "Last Event Type",
 ]
 RESERVATION_SHEET_HEADERS = [
-    "Timestamp",
-    "User ID",
+    "Created At",
+    "Source / User ID",
     "Reservation Type",
     "Reservation Message",
 ]
@@ -902,7 +902,7 @@ def build_order_sheet_row(user_id: str, state: Dict[str, Any], event_type: str, 
         profile.get("mobile", ""),
         profile.get("email", ""),
         profile.get("service_type", ""),
-        profile.get("preferred_time", ""),
+        "",
         profile.get("guests", ""),
         items_summary,
         str(order.get("total", Decimal("0.00"))),
@@ -1673,7 +1673,7 @@ def build_order_sheet_row_from_token_payload(token_payload: Dict[str, Any], even
         profile.get("mobile", ""),
         profile.get("email", ""),
         profile.get("service_type", ""),
-        profile.get("preferred_time", ""),
+        "",
         profile.get("guests", ""),
         items_summary,
         token_payload.get("total", "0.00"),
@@ -1729,7 +1729,7 @@ def build_validated_order_token_payload(payload: Dict[str, Any]) -> Dict[str, An
             "mobile": str(payload.get("mobile", "")).strip(),
             "email": str(payload.get("email", "")).strip(),
             "service_type": str(payload.get("service_type", "")).strip(),
-            "preferred_time": str(payload.get("preferred_time", "")).strip(),
+            "preferred_time": "",
             "guests": str(payload.get("guests", "")).strip(),
             "notes": str(payload.get("notes", "")).strip(),
             "intent": str(payload.get("intent", "")).strip(),
@@ -2330,9 +2330,6 @@ def learn_from_confirmed_order(state: Dict[str, Any]) -> None:
         if note and note not in modifiers:
             modifiers.append(note)
 
-    preferred_time = state.get("customer_profile", {}).get("preferred_time", "").strip()
-    if preferred_time:
-        time_slots[preferred_time] = time_slots.get(preferred_time, 0) + 1
     state.setdefault("customer_profile", {})["insights"] = analyze_customer_behavior(state)
 
 
@@ -2435,8 +2432,6 @@ def generate_final_order_summary(state: Dict[str, Any]) -> str:
         lines.append(f"Email: {profile['email']}")
     if profile.get("service_type"):
         lines.append(f"Service: {profile['service_type']}")
-    if profile.get("preferred_time"):
-        lines.append(f"Time: {profile['preferred_time']}")
     if profile.get("guests"):
         lines.append(f"Guests: {profile['guests']}")
 
@@ -2629,7 +2624,7 @@ def append_sheet_log(user_id: str, state: Dict[str, Any], event_type: str) -> No
         profile.get("mobile", ""),
         profile.get("email", ""),
         profile.get("service_type", ""),
-        profile.get("preferred_time", ""),
+        "",
         profile.get("guests", ""),
         str(order.get("total", Decimal("0.00"))),
         order.get("currency", DEFAULT_CURRENCY),
@@ -2864,7 +2859,6 @@ def greeting_message() -> str:
 def greeting_message_for_state(state: Dict[str, Any]) -> str:
     insights = state.get("customer_profile", {}).get("insights", {})
     favorite_items = insights.get("favorite_items", [])
-    preferred_time = str(insights.get("preferred_time", "")).strip()
     order_frequency = int(insights.get("order_frequency", 0) or 0)
     opener = choose_variant(
         state,
@@ -2891,8 +2885,6 @@ def greeting_message_for_state(state: Dict[str, Any]) -> str:
         lines.extend(["", f"Welcome back! Want your usual {usual_line} again?"])
     elif order_frequency > 0:
         lines.extend(["", "Welcome back. Ready for another order?"])
-    if preferred_time:
-        lines.extend(["", f"You usually order around {preferred_time} 😏"])
     if favorite_items:
         lines.extend(["", "Your favorites:", *[f"* {item}" for item in favorite_items[:3]], "Reply YES to reorder instantly."])
     else:
@@ -3689,7 +3681,7 @@ def create_order_token_api() -> Tuple[Any, int]:
                 token_payload["profile"].get("mobile", ""),
                 token_payload["profile"].get("email", ""),
                 token_payload["profile"].get("service_type", ""),
-                token_payload["profile"].get("preferred_time", ""),
+                "",
                 token_payload["profile"].get("guests", ""),
                 token_payload["total"],
                 token_payload["currency"],

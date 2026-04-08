@@ -727,6 +727,7 @@ def save_confirmed_order_to_google_sheets(
         raise RuntimeError("worksheet_unavailable")
 
     timestamp = utc_now().isoformat()
+    current_order_id = state.get("order", {}).get("order_id", "")
 
     with google_sheets_lock:
         order_ids = worksheet.col_values(2)
@@ -734,7 +735,7 @@ def save_confirmed_order_to_google_sheets(
 
         target_row_index = None
         for index, existing_order_id in enumerate(order_ids[1:], start=2):
-            if existing_order_id == previous_order_id or existing_order_id == new_order_id:
+            if existing_order_id == previous_order_id or existing_order_id == current_order_id:
                 target_row_index = index
                 break
 

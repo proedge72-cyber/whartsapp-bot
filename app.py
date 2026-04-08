@@ -1971,7 +1971,7 @@ def recent_order_choices_message(state: Dict[str, Any]) -> str:
 def payment_success_message(state: Dict[str, Any]) -> str:
     return (
         "Payment received. Your order is now being prepared \U0001f37d\ufe0f\n\n"
-        "\u23f3 Estimated time: 15 minutes\n\n"
+        "\u23f3 Estimated time: 15-20 minutes\n\n"
         f"{generate_final_order_summary(state)}"
     )
 
@@ -2668,7 +2668,7 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
             return error_message
         return (
             "Perfect. Payment is marked for counter. Your order is now being prepared \U0001f37d\ufe0f\n\n"
-            "\u23f3 Estimated time: 15 minutes\n\n"
+            "\u23f3 Estimated time: 15-20 minutes\n\n"
             f"{generate_final_order_summary(state)}"
         )
     if action == "check_order_stage":
@@ -2822,7 +2822,7 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
                     return error_message
                 return (
                     "Thank you for waiting. I’ve confirmed the payment and your order is now being prepared \U0001f37d\ufe0f\n\n"
-                    "\u23f3 Estimated time: 15 minutes\n\n"
+                    "\u23f3 Estimated time: 15-20 minutes\n\n"
                     f"{generate_final_order_summary(state)}"
                 )
         except requests.RequestException as exc:

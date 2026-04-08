@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from flask import Flask, jsonify, request
+import gspread
+from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
 
@@ -36,6 +38,10 @@ RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
 RAZORPAY_BASE_URL = os.getenv("RAZORPAY_BASE_URL", "https://api.razorpay.com/v1/payment_links")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 SHEET_WEBHOOK_URL = os.getenv("SHEET_WEBHOOK_URL", "")
+GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+GOOGLE_SHEETS_EVENT_SHEET = os.getenv("GOOGLE_SHEETS_EVENT_SHEET", "Events")
+GOOGLE_SHEETS_RESERVATION_SHEET = os.getenv("GOOGLE_SHEETS_RESERVATION_SHEET", "Reservations")
 HUMAN_HANDOFF_CONTACT = os.getenv("HUMAN_HANDOFF_CONTACT", "")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -75,6 +81,8 @@ db_lock = threading.Lock()
 processed_message_ids = set()
 payment_followup_timers: Dict[str, threading.Timer] = {}
 payment_timer_lock = threading.Lock()
+google_sheets_client = None
+google_sheets_lock = threading.Lock()
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -115,6 +123,27 @@ initialize_db()
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def initialize_google_sheets_client() -> Optional[gspread.Client]:
+    if not GOOGLE_SHEETS_SPREADSHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return None
+    try:
+        service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        credentials = Credentials.from_service_account_info(
+            service_account_info,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ],
+        )
+        return gspread.authorize(credentials)
+    except Exception as exc:
+        logger.warning("Google Sheets client initialization failed: %s", exc)
+        return None
+
+
+google_sheets_client = initialize_google_sheets_client()
 
 
 def create_default_state() -> Dict[str, Any]:
@@ -758,6 +787,30 @@ def send_whatsapp_message(to: str, body: str, max_words: int = 80) -> None:
 
 
 def append_sheet_log(user_id: str, state: Dict[str, Any], event_type: str) -> None:
+    order = state.get("order", {})
+    profile = state.get("customer_profile", {})
+    append_google_sheet_row(
+        GOOGLE_SHEETS_EVENT_SHEET,
+        [
+            utc_now().isoformat(),
+            user_id,
+            event_type,
+            order.get("order_id", ""),
+            profile.get("name", ""),
+            profile.get("mobile", ""),
+            profile.get("email", ""),
+            profile.get("service_type", ""),
+            profile.get("preferred_time", ""),
+            profile.get("guests", ""),
+            str(order.get("total", Decimal("0.00"))),
+            order.get("currency", DEFAULT_CURRENCY),
+            state.get("payment_status", ""),
+            state.get("payment_method", ""),
+            state.get("order_stage", ""),
+            state.get("stage", ""),
+            json.dumps(serialize_state(state)),
+        ],
+    )
     if not SHEET_WEBHOOK_URL:
         return
     payload = {
@@ -832,6 +885,40 @@ def save_reservation_record(user_id: str, details: Dict[str, Any]) -> None:
             (user_id, json.dumps(details), utc_now().isoformat()),
         )
         db.commit()
+    append_google_sheet_row(
+        GOOGLE_SHEETS_RESERVATION_SHEET,
+        [
+            utc_now().isoformat(),
+            user_id,
+            details.get("type", ""),
+            details.get("message", ""),
+        ],
+    )
+
+
+def get_or_create_google_worksheet(sheet_name: str) -> Optional[gspread.Worksheet]:
+    if not google_sheets_client or not GOOGLE_SHEETS_SPREADSHEET_ID:
+        return None
+    try:
+        spreadsheet = google_sheets_client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
+        try:
+            return spreadsheet.worksheet(sheet_name)
+        except gspread.WorksheetNotFound:
+            return spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=30)
+    except Exception as exc:
+        logger.warning("Google Sheets worksheet access failed: %s", exc)
+        return None
+
+
+def append_google_sheet_row(sheet_name: str, row: List[str]) -> None:
+    worksheet = get_or_create_google_worksheet(sheet_name)
+    if not worksheet:
+        return
+    try:
+        with google_sheets_lock:
+            worksheet.append_row(row, value_input_option="USER_ENTERED")
+    except Exception as exc:
+        logger.warning("Google Sheets append failed: %s", exc)
 
 
 def should_ignore_duplicate(message_id: str) -> bool:

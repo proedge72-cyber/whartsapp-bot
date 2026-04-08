@@ -327,6 +327,41 @@ def extract_order_id(text: str) -> Optional[str]:
     return match.group(0) if match else None
 
 
+def sorted_order_ids(state: Dict[str, Any]) -> List[str]:
+    orders = state.get("orders", {})
+    return sorted(
+        orders.keys(),
+        key=lambda order_id: (
+            orders[order_id].get("created_at") or datetime.min.replace(tzinfo=timezone.utc),
+            order_id,
+        ),
+    )
+
+
+def resolve_order_reference(state: Dict[str, Any], text: str) -> Optional[str]:
+    explicit = extract_order_id(text)
+    if explicit:
+        return explicit
+
+    upper_text = text.upper()
+    suffix_match = re.search(r"\b(\d{4})\b", upper_text)
+    if suffix_match:
+        suffix = suffix_match.group(1)
+        for order_id in sorted_order_ids(state):
+            if order_id.endswith(f"-{suffix}"):
+                return order_id
+
+    lowered = text.lower()
+    order_ids = sorted_order_ids(state)
+    if not order_ids:
+        return None
+    if any(phrase in lowered for phrase in {"first order", "old order", "older order", "previous order"}):
+        return order_ids[0]
+    if any(phrase in lowered for phrase in {"second order", "latest order", "new order", "recent order"}):
+        return order_ids[-1]
+    return None
+
+
 def normalize_text(text: str) -> str:
     return (text or "").strip()
 
@@ -931,7 +966,7 @@ def check_order_stage_message(state: Dict[str, Any]) -> str:
 
 def infer_intent_rule(text: str, state: Dict[str, Any]) -> str:
     lowered = text.lower().strip()
-    if extract_order_id(text):
+    if resolve_order_reference(state, text):
         return "track_specific_order"
     if detect_order_message(text):
         return "order_checkout"
@@ -1252,7 +1287,7 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
     if intent == "order_start":
         return execute_action(user_id, state, {"action": "show_menu_link"}, text)
     if intent == "track_specific_order":
-        order_id = extract_order_id(text)
+        order_id = resolve_order_reference(state, text)
         record = get_order_record(state, order_id or "")
         if not record:
             return "I couldn’t find that order ID. Please check it and send it again."

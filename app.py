@@ -2679,22 +2679,8 @@ def learn_from_confirmed_order(state: Dict[str, Any]) -> None:
 
 
 def generate_order_summary(order: Dict[str, Any], state: Optional[Dict[str, Any]] = None) -> str:
-    name = order.get("name") or "there"
     currency = order.get("currency", DEFAULT_CURRENCY)
-    if state is None:
-        intro = f"Here\u2019s your updated order, {name} \U0001f60f"
-    else:
-        favorite_items = get_user_context(state).get("most_frequent_items", [])
-        has_favorite = any(item.get("name") in favorite_items for item in order.get("items", []))
-        intro = choose_variant(
-            state,
-            "order_summary_intro",
-            [
-                f"Nice choice, {name}. Here\u2019s your updated order \U0001f60f" if has_favorite else f"Here\u2019s your updated order, {name} \U0001f60f",
-                f"This is your updated order, {name} \U0001f60f",
-                f"Your latest order looks like this, {name} \U0001f60f",
-            ],
-        )
+    intro = build_order_summary_intro(order, state)
     lines = [intro, ""]
     if order.get("order_id"):
         lines.append(f"Order ID: {order['order_id']}")
@@ -3195,6 +3181,58 @@ def choose_variant(state: Dict[str, Any], key: str, options: List[str]) -> str:
     index = (counters.get(key, 0) + seed) % len(options)
     counters[key] = counters.get(key, 0) + 1
     return options[index]
+
+
+def choose_emoji_variant(state: Dict[str, Any], key: str, options: List[str]) -> str:
+    return choose_variant(state, key, options)
+
+
+def build_order_summary_intro(order: Dict[str, Any], state: Optional[Dict[str, Any]] = None) -> str:
+    name = order.get("name") or "there"
+    if state is None:
+        return f"Here is your updated order, {name}."
+
+    favorite_items = get_user_context(state).get("most_frequent_items", [])
+    has_favorite = any(item.get("name") in favorite_items for item in order.get("items", []))
+    item_count = sum(int(item.get("qty", 0) or 0) for item in order.get("items", []))
+    total_text = money_to_text(order.get("total", Decimal("0.00")), order.get("currency", DEFAULT_CURRENCY))
+    emoji = choose_emoji_variant(
+        state,
+        "order_summary_emoji",
+        ["🍽️", "✨", "🔥", "😊", "🌟", "🥘", "💫", "👌"],
+    )
+    templates = [
+        f"{emoji} {name}, your cart is looking good. Here is the latest version.",
+        f"{emoji} I have refreshed everything for you, {name}. Here is the current order.",
+        f"{emoji} {name}, this is what I have ready for you right now.",
+        f"{emoji} Your order is nicely lined up now, {name}. Here is the full view.",
+        f"{emoji} Quick update, {name}: this is the order I have on my side.",
+        f"{emoji} {name}, everything is neatly arranged. Here is your current order summary.",
+        f"{emoji} This version looks clean, {name}. Here is what is in the order now.",
+        f"{emoji} {name}, I have pulled together the latest order details for you.",
+    ]
+    if has_favorite:
+        templates.extend(
+            [
+                f"{emoji} Nice mix, {name}. I can see one of your usual picks in here too.",
+                f"{emoji} {name}, this order has one of your repeat favorites. Here is the updated view.",
+            ]
+        )
+    if item_count >= 4:
+        templates.extend(
+            [
+                f"{emoji} {name}, your meal is coming together really well. You have {item_count} items so far.",
+                f"{emoji} This is shaping up to be a full order, {name}. I currently have {item_count} items for {total_text}.",
+            ]
+        )
+    else:
+        templates.extend(
+            [
+                f"{emoji} {name}, this is a nice start. I currently have {item_count} item{'s' if item_count != 1 else ''} in the order.",
+                f"{emoji} Small update for you, {name}: the order is sitting at {item_count} item{'s' if item_count != 1 else ''} for now.",
+            ]
+        )
+    return choose_variant(state, "order_summary_intro", templates)
 
 
 def greeting_message() -> str:

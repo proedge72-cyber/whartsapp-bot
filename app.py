@@ -217,6 +217,8 @@ payment_followup_timers: Dict[str, threading.Timer] = {}
 payment_timer_lock = threading.Lock()
 google_sheets_client = None
 google_sheets_lock = threading.RLock()
+google_order_ids_cache: set[str] = set()
+google_order_ids_loaded = False
 
 EVENT_SHEET_HEADERS = [
     "Timestamp",
@@ -694,23 +696,40 @@ def fetch_existing_order_ids(worksheet: gspread.Worksheet) -> set[str]:
     return {order_id.strip() for order_id in order_ids[1:] if order_id.strip()}
 
 
-def save_confirmed_order_to_google_sheets(user_id: str, state: Dict[str, Any], event_type: str = "order_confirmed") -> None:
+def get_cached_existing_order_ids(worksheet: gspread.Worksheet, force_refresh: bool = False) -> set[str]:
+    global google_order_ids_loaded
+    with google_sheets_lock:
+        if force_refresh or not google_order_ids_loaded:
+            google_order_ids_cache.clear()
+            google_order_ids_cache.update(fetch_existing_order_ids(worksheet))
+            google_order_ids_loaded = True
+        return set(google_order_ids_cache)
+
+
+def reserve_unique_google_order_id(worksheet: gspread.Worksheet, previous_order_id: str = "") -> str:
+    existing_ids = get_cached_existing_order_ids(worksheet)
+    if previous_order_id:
+        existing_ids.discard(previous_order_id)
+    new_order_id = get_unique_order_id(existing_ids)
+    with google_sheets_lock:
+        google_order_ids_cache.add(new_order_id)
+    return new_order_id
+
+
+def save_confirmed_order_to_google_sheets(
+    user_id: str,
+    state: Dict[str, Any],
+    previous_order_id: str = "",
+    event_type: str = "order_confirmed",
+) -> None:
     worksheet = get_or_create_google_worksheet(GOOGLE_SHEETS_ORDER_SHEET)
     if not worksheet:
         raise RuntimeError("worksheet_unavailable")
 
-    previous_order_id = state.get("active_order_id") or state.get("order", {}).get("order_id", "")
     timestamp = utc_now().isoformat()
 
     with google_sheets_lock:
         order_ids = worksheet.col_values(2)
-        existing_ids = {order_id.strip() for order_id in order_ids[1:] if order_id.strip()}
-        if previous_order_id:
-            existing_ids.discard(previous_order_id)
-
-        new_order_id = get_unique_order_id(existing_ids)
-        update_state_order_id(state, new_order_id)
-        sync_active_order_record(state)
         row = build_order_sheet_row(user_id, state, event_type, timestamp)
 
         target_row_index = None
@@ -724,15 +743,42 @@ def save_confirmed_order_to_google_sheets(user_id: str, state: Dict[str, Any], e
         else:
             worksheet.update(f"A{target_row_index}:Q{target_row_index}", [row], value_input_option="USER_ENTERED")
 
+        google_order_ids_cache.update(order_id.strip() for order_id in order_ids[1:] if order_id.strip())
+        if state.get("order", {}).get("order_id"):
+            google_order_ids_cache.add(state["order"]["order_id"])
+
+
+def persist_confirmed_order_async(user_id: str, state_snapshot: Dict[str, Any], previous_order_id: str) -> None:
+    try:
+        save_confirmed_order_to_google_sheets(user_id, state_snapshot, previous_order_id=previous_order_id)
+    except Exception as exc:
+        logger.warning("Confirmed order save failed: %s", exc)
+        try:
+            send_whatsapp_message(user_id, "⚠️ Order could not be saved. Please try again.")
+        except Exception as send_exc:
+            logger.warning("Failed to send order save error message: %s", send_exc)
+
 
 def confirm_order_and_store(user_id: str, state: Dict[str, Any]) -> Optional[str]:
     try:
-        save_confirmed_order_to_google_sheets(user_id, state)
+        worksheet = get_or_create_google_worksheet(GOOGLE_SHEETS_ORDER_SHEET)
+        if not worksheet:
+            raise RuntimeError("worksheet_unavailable")
+        previous_order_id = state.get("active_order_id") or state.get("order", {}).get("order_id", "")
+        new_order_id = reserve_unique_google_order_id(worksheet, previous_order_id=previous_order_id)
+        update_state_order_id(state, new_order_id)
     except Exception as exc:
         logger.warning("Confirmed order save failed: %s", exc)
         return "⚠️ Order could not be saved. Please try again."
 
     finalize_confirmation(state)
+    state_snapshot = deepcopy(state)
+    worker = threading.Thread(
+        target=persist_confirmed_order_async,
+        args=(user_id, state_snapshot, previous_order_id),
+        daemon=True,
+    )
+    worker.start()
     return None
 
 
@@ -2147,7 +2193,9 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         state["payment_verification_attempts"] += 1
         try:
             if verify_online_payment(state):
-                finalize_confirmation(state)
+                error_message = confirm_order_and_store(user_id, state)
+                if error_message:
+                    return error_message
                 return (
                     "Thank you for waiting. I’ve confirmed the payment and your order is now being prepared \U0001f37d\ufe0f\n\n"
                     "\u23f3 Estimated time: 15 minutes\n\n"
@@ -2192,7 +2240,9 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
 
         state["payment_method"] = "counter"
         state["payment_status"] = "done"
-        finalize_confirmation(state)
+        error_message = confirm_order_and_store(user_id, state)
+        if error_message:
+            return error_message
         cancel_payment_followup(user_id, state.get("active_order_id", ""))
         return payment_counter_fallback_message(state)
     if intent == "payment_pending":

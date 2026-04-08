@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import sqlite3
 import string
 import threading
@@ -228,6 +229,7 @@ EVENT_SHEET_HEADERS = [
     "User ID",
     "Event Type",
     "Order ID",
+    "Order Token",
     "Customer Name",
     "Mobile",
     "Email",
@@ -245,6 +247,7 @@ EVENT_SHEET_HEADERS = [
 ORDER_SHEET_HEADERS = [
     "Last Updated",
     "Order ID",
+    "Order Token",
     "User ID",
     "Customer Name",
     "Mobile",
@@ -270,11 +273,11 @@ RESERVATION_SHEET_HEADERS = [
 SHEET_LAYOUTS: Dict[str, Dict[str, Any]] = {
     GOOGLE_SHEETS_EVENT_SHEET: {
         "headers": EVENT_SHEET_HEADERS,
-        "widths": [190, 120, 120, 130, 170, 120, 220, 130, 130, 110, 90, 90, 120, 120, 110, 150, 420],
+        "widths": [190, 120, 120, 130, 180, 170, 120, 220, 130, 130, 110, 90, 90, 120, 120, 110, 150, 420],
     },
     GOOGLE_SHEETS_ORDER_SHEET: {
         "headers": ORDER_SHEET_HEADERS,
-        "widths": [190, 130, 120, 170, 120, 220, 130, 130, 110, 320, 90, 90, 120, 120, 110, 150, 120],
+        "widths": [190, 130, 180, 120, 170, 120, 220, 130, 130, 110, 320, 90, 90, 120, 120, 110, 150, 120],
     },
     GOOGLE_SHEETS_RESERVATION_SHEET: {
         "headers": RESERVATION_SHEET_HEADERS,
@@ -313,6 +316,17 @@ def initialize_db() -> None:
             )
             """
         )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS order_tokens (
+                token TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT
+            )
+            """
+        )
         db.commit()
 
 
@@ -321,6 +335,156 @@ initialize_db()
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def order_token_expiry() -> datetime:
+    return utc_now() + timedelta(minutes=30)
+
+
+def generate_order_token() -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(16))
+
+
+def website_order_id_from_token(token: str) -> str:
+    return f"WEB-{token}"
+
+
+def create_order_token_record(payload: Dict[str, Any]) -> str:
+    created_at = utc_now()
+    expires_at = order_token_expiry()
+    token = str(payload.get("order_token", "")).strip() or generate_order_token()
+    for _ in range(5):
+        try:
+            with db_lock:
+                db.execute(
+                    "INSERT INTO order_tokens (token, payload_json, created_at, expires_at, used_at) VALUES (?, ?, ?, ?, NULL)",
+                    (
+                        token,
+                        json.dumps(payload),
+                        created_at.isoformat(),
+                        expires_at.isoformat(),
+                    ),
+                )
+                db.commit()
+            return token
+        except sqlite3.IntegrityError:
+            token = generate_order_token()
+            payload["order_token"] = token
+            continue
+    raise RuntimeError("token_generation_failed")
+
+
+def consume_order_token_record(token: str) -> Optional[Dict[str, Any]]:
+    with db_lock:
+        row = db.execute(
+            "SELECT payload_json, expires_at, used_at FROM order_tokens WHERE token = ?",
+            (token,),
+        ).fetchone()
+        if not row:
+            return None
+        expires_at = datetime.fromisoformat(row["expires_at"])
+        if row["used_at"] or expires_at < utc_now():
+            return None
+        db.execute(
+            "UPDATE order_tokens SET used_at = ? WHERE token = ?",
+            (utc_now().isoformat(), token),
+        )
+        db.commit()
+    try:
+        return json.loads(row["payload_json"])
+    except json.JSONDecodeError:
+        return None
+
+
+def parse_optional_iso_datetime(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def website_token_expiry(payload: Dict[str, Any]) -> datetime:
+    explicit_expiry = parse_optional_iso_datetime(payload.get("expires_at"))
+    if explicit_expiry:
+        return explicit_expiry
+    created_at = parse_optional_iso_datetime(payload.get("created_at")) or utc_now()
+    return created_at + timedelta(minutes=15)
+
+
+def delete_google_sheet_rows_by_token(token: str) -> None:
+    normalized_token = str(token or "").strip().upper()
+    if not normalized_token:
+        return
+
+    def delete_matching_rows(sheet_name: str, token_column_index: int) -> None:
+        worksheet = get_or_create_google_worksheet(sheet_name)
+        if not worksheet:
+            return
+        with google_sheets_lock:
+            token_values = worksheet.col_values(token_column_index)
+            row_numbers = [
+                index
+                for index, cell_value in enumerate(token_values[1:], start=2)
+                if str(cell_value).strip().upper() == normalized_token
+            ]
+            for row_number in reversed(row_numbers):
+                worksheet.delete_rows(row_number)
+
+    try:
+        delete_matching_rows(GOOGLE_SHEETS_EVENT_SHEET, 5)
+        delete_matching_rows(GOOGLE_SHEETS_ORDER_SHEET, 3)
+    except Exception as exc:
+        logger.warning("Google Sheets token cleanup failed for %s: %s", normalized_token, exc)
+
+
+def consume_google_sheet_token_payload(token: str) -> Optional[Dict[str, Any]]:
+    if not token:
+        return None
+
+    worksheet = get_or_create_google_worksheet(GOOGLE_SHEETS_EVENT_SHEET)
+    if not worksheet:
+        return None
+
+    try:
+        with google_sheets_lock:
+            token_column = worksheet.col_values(5)
+        for index, existing_token in enumerate(token_column[1:], start=2):
+            if str(existing_token).strip().upper() != token.upper():
+                continue
+            row_values = worksheet.row_values(index)
+            if len(row_values) < 18:
+                continue
+            payload_json = str(row_values[17]).strip()
+            if not payload_json:
+                continue
+            payload = json.loads(payload_json)
+            if str(payload.get("order_token", "")).strip().upper() != token.upper():
+                continue
+            expires_at = website_token_expiry(payload)
+            if expires_at < utc_now():
+                delete_google_sheet_rows_by_token(token)
+                return None
+            delete_google_sheet_rows_by_token(token)
+            payload["token_status"] = "consumed"
+            payload["consumed_at"] = utc_now().isoformat()
+            return payload
+    except Exception as exc:
+        logger.warning("Google Sheets token lookup failed: %s", exc)
+    return None
+
+
+def consume_any_order_token_record(token: str) -> Optional[Dict[str, Any]]:
+    payload = consume_order_token_record(token)
+    if payload:
+        return payload
+    return consume_google_sheet_token_payload(token)
 
 
 def normalize_google_service_account_info(service_account_info: Dict[str, Any]) -> Dict[str, Any]:
@@ -505,6 +669,7 @@ def create_default_state() -> Dict[str, Any]:
         "orders": {},
         "order": {
             "order_id": "",
+            "order_token": "",
             "name": "",
             "items": [],
             "total": Decimal("0.00"),
@@ -669,6 +834,7 @@ def get_state(user_id: str) -> Dict[str, Any]:
 def empty_order() -> Dict[str, Any]:
     return {
         "order_id": "",
+        "order_token": "",
         "name": "",
         "items": [],
         "total": Decimal("0.00"),
@@ -730,6 +896,7 @@ def build_order_sheet_row(user_id: str, state: Dict[str, Any], event_type: str, 
     return [
         timestamp or utc_now().isoformat(),
         order.get("order_id", ""),
+        order.get("order_token", ""),
         user_id,
         profile.get("name", ""),
         profile.get("mobile", ""),
@@ -895,7 +1062,7 @@ def save_confirmed_order_to_google_sheets(
         if target_row_index is None:
             worksheet.append_row(row, value_input_option="USER_ENTERED", table_range="A1")
         else:
-            worksheet.update(f"A{target_row_index}:Q{target_row_index}", [row], value_input_option="USER_ENTERED")
+            worksheet.update(f"A{target_row_index}:R{target_row_index}", [row], value_input_option="USER_ENTERED")
 
         google_order_ids_cache.update(order_id.strip() for order_id in order_ids[1:] if order_id.strip())
         if state.get("order", {}).get("order_id"):
@@ -955,6 +1122,7 @@ def sync_active_order_record(state: Dict[str, Any]) -> None:
     state["active_order_id"] = order_id
     state.setdefault("orders", {})[order_id] = {
         "order_id": order_id,
+        "order_token": order.get("order_token", ""),
         "name": order.get("name", ""),
         "items": deepcopy(order.get("items", [])),
         "total": order.get("total", Decimal("0.00")),
@@ -975,6 +1143,7 @@ def start_new_order(state: Dict[str, Any], user_id: str) -> str:
     state["active_order_id"] = new_order_id
     state["order"] = empty_order()
     state["order"]["order_id"] = new_order_id
+    state["order"]["order_token"] = ""
     state["order"]["name"] = state.get("customer_profile", {}).get("name", "")
     state["payment_status"] = "pending"
     state["payment_method"] = ""
@@ -987,6 +1156,7 @@ def start_new_order(state: Dict[str, Any], user_id: str) -> str:
     state["confirmed_at"] = None
     state.setdefault("orders", {})[new_order_id] = {
         "order_id": new_order_id,
+        "order_token": "",
         "name": state["order"]["name"],
         "items": [],
         "total": Decimal("0.00"),
@@ -1012,6 +1182,16 @@ def get_order_record(state: Dict[str, Any], order_id: str) -> Optional[Dict[str,
 
 def extract_order_id(text: str) -> Optional[str]:
     match = re.search(r"\b(?:AGN-\d{4}-\d{4}|ORD-\d{8}-[A-Z0-9]{5})\b", text.upper())
+    return match.group(0) if match else None
+
+
+def extract_order_token(text: str) -> Optional[str]:
+    upper_text = text.upper()
+    match = re.search(r"\b[A-Z0-9]{16}\b", upper_text)
+    if match:
+        return match.group(0)
+    collapsed = re.sub(r"[^A-Z0-9]+", "", upper_text)
+    match = re.search(r"[A-Z0-9]{16}", collapsed)
     return match.group(0) if match else None
 
 
@@ -1116,6 +1296,11 @@ def parse_order(text: str) -> List[Dict[str, Any]]:
 
 
 def find_menu_item(name: str) -> Optional[Dict[str, Any]]:
+    match = find_menu_item_with_context(name)
+    return match["item"] if match else None
+
+
+def find_menu_item_with_context(name: str) -> Optional[Dict[str, Any]]:
     normalized_name = normalize_menu_text(name)
     if not normalized_name:
         return None
@@ -1124,19 +1309,28 @@ def find_menu_item(name: str) -> Optional[Dict[str, Any]]:
     for page in FIXED_MENU_PAGES.values():
         for category in page["categories"]:
             for item in category["items"]:
-                all_items.append((normalize_menu_text(item["name"]), item))
+                all_items.append(
+                    (
+                        normalize_menu_text(item["name"]),
+                        {
+                            "page": page,
+                            "category": category,
+                            "item": item,
+                        },
+                    )
+                )
 
-    for candidate_name, item in all_items:
+    for candidate_name, item_context in all_items:
         if candidate_name == normalized_name:
-            return item
+            return item_context
 
     close_matches = difflib.get_close_matches(normalized_name, [candidate for candidate, _ in all_items], n=1, cutoff=0.8)
     if not close_matches:
         return None
     winner = close_matches[0]
-    for candidate_name, item in all_items:
+    for candidate_name, item_context in all_items:
         if candidate_name == winner:
-            return item
+            return item_context
     return None
 
 
@@ -1390,6 +1584,134 @@ def update_customer_profile(state: Dict[str, Any], profile_data: Dict[str, str])
             state["customer_profile"][key] = value
     if state["customer_profile"].get("name") and not state["order"]["name"]:
         state["order"]["name"] = state["customer_profile"]["name"]
+
+
+def load_order_from_token_payload(user_id: str, state: Dict[str, Any], payload: Dict[str, Any]) -> str:
+    if not state.get("active_order_id") or state.get("payment_status") == "done" or state.get("order_stage") in {"preparing", "served"}:
+        start_new_order(state, user_id)
+
+    profile = payload.get("profile", {})
+    items = payload.get("items", [])
+    normalized_items = [
+        {
+            "name": item.get("name", ""),
+            "qty": int(item.get("qty", 0) or 0),
+            "price": Decimal(str(item.get("price", "0.00"))),
+        }
+        for item in items
+        if item.get("name") and int(item.get("qty", 0) or 0) > 0
+    ]
+    total = sum((item["price"] for item in normalized_items), Decimal("0.00"))
+
+    update_customer_profile(state, {key: str(value) for key, value in profile.items() if value is not None})
+    state["intent"] = "order"
+    state["waiting_for_order"] = False
+    state["checkout_mode"] = "append"
+    state["order"] = {
+        "order_id": state.get("active_order_id", state.get("order", {}).get("order_id", "")),
+        "order_token": str(payload.get("order_token", "")).strip(),
+        "name": state.get("customer_profile", {}).get("name", profile.get("name", "")),
+        "items": normalized_items,
+        "total": total,
+        "currency": payload.get("currency", DEFAULT_CURRENCY),
+    }
+    apply_saved_preferences_to_order(state)
+    state["order_confirmed"] = False
+    state["payment_status"] = "pending"
+    state["payment_method"] = ""
+    state["payment_link"] = ""
+    state["payment_link_id"] = ""
+    state["payment_verification_attempts"] = 0
+    set_stage(state, STAGE_ORDER_ACTION)
+    state["failure_count"] = 0
+    sync_active_order_record(state)
+    append_sheet_log(user_id, state, "order_token_loaded")
+    return generate_order_summary(state["order"], state)
+
+
+def build_order_sheet_row_from_token_payload(token_payload: Dict[str, Any], event_type: str, timestamp: Optional[str] = None) -> List[str]:
+    profile = token_payload.get("profile", {})
+    items_summary = ", ".join(
+        f"{item.get('name', '')} x{item.get('qty', 0)}"
+        for item in token_payload.get("items", [])
+    )
+    return [
+        timestamp or utc_now().isoformat(),
+        token_payload.get("order_id", ""),
+        token_payload.get("order_token", ""),
+        "website",
+        profile.get("name", ""),
+        profile.get("mobile", ""),
+        profile.get("email", ""),
+        profile.get("service_type", ""),
+        profile.get("preferred_time", ""),
+        profile.get("guests", ""),
+        items_summary,
+        token_payload.get("total", "0.00"),
+        token_payload.get("currency", DEFAULT_CURRENCY),
+        "pending",
+        "whatsapp_token",
+        "token_created",
+        "website_token_created",
+        event_type,
+    ]
+
+
+def build_validated_order_token_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    raw_items = payload.get("items") or []
+    validated_items: List[Dict[str, Any]] = []
+    for raw_item in raw_items:
+        item_name = str(raw_item.get("name", "")).strip()
+        quantity = int(raw_item.get("qty", 0) or 0)
+        menu_item_context = find_menu_item_with_context(item_name)
+        if not menu_item_context or quantity <= 0:
+            continue
+        menu_item = menu_item_context["item"]
+        category = menu_item_context["category"]
+        page = menu_item_context["page"]
+        unit_price = normalize_price(menu_item["price"])
+        line_total = (unit_price * quantity).quantize(Decimal("0.01"))
+        validated_items.append(
+            {
+                "name": menu_item["name"],
+                "qty": quantity,
+                "price": str(line_total),
+                "unit_price": str(unit_price.quantize(Decimal("0.01"))),
+                "category": category["name"],
+                "menu_page": page["label"],
+                "description": str(menu_item.get("description", "")).strip(),
+                "price_label": str(menu_item.get("price", "")).strip(),
+            }
+        )
+
+    if not validated_items:
+        raise ValueError("valid_items_required")
+
+    total = sum((Decimal(item["price"]) for item in validated_items), Decimal("0.00")).quantize(Decimal("0.01"))
+    order_token = generate_order_token()
+    created_at = utc_now().isoformat()
+    order_id = website_order_id_from_token(order_token)
+    return {
+        "order_id": order_id,
+        "order_token": order_token,
+        "created_at": created_at,
+        "profile": {
+            "name": str(payload.get("name", "")).strip(),
+            "mobile": str(payload.get("mobile", "")).strip(),
+            "email": str(payload.get("email", "")).strip(),
+            "service_type": str(payload.get("service_type", "")).strip(),
+            "preferred_time": str(payload.get("preferred_time", "")).strip(),
+            "guests": str(payload.get("guests", "")).strip(),
+            "notes": str(payload.get("notes", "")).strip(),
+            "intent": str(payload.get("intent", "")).strip(),
+        },
+        "currency": str(payload.get("currency", DEFAULT_CURRENCY)).strip() or DEFAULT_CURRENCY,
+        "items": validated_items,
+        "total": str(total),
+        "item_count": sum(int(item["qty"]) for item in validated_items),
+        "items_summary": ", ".join(f"{item['name']} x{item['qty']}" for item in validated_items),
+        "created_from": "website",
+    }
 
 
 def get_menu_category_map() -> Dict[str, str]:
@@ -2267,6 +2589,7 @@ def append_sheet_log(user_id: str, state: Dict[str, Any], event_type: str) -> No
         user_id,
         event_type,
         order.get("order_id", ""),
+        order.get("order_token", ""),
         profile.get("name", ""),
         profile.get("mobile", ""),
         profile.get("email", ""),
@@ -2407,7 +2730,7 @@ def upsert_order_sheet_row(user_id: str, state: Dict[str, Any], event_type: str)
         if target_row_index is None:
             worksheet.append_row(row, value_input_option="USER_ENTERED", table_range="A1")
         else:
-            worksheet.update(f"A{target_row_index}:Q{target_row_index}", [row], value_input_option="USER_ENTERED")
+            worksheet.update(f"A{target_row_index}:R{target_row_index}", [row], value_input_option="USER_ENTERED")
 
 
 def get_or_create_google_worksheet(sheet_name: str) -> Optional[gspread.Worksheet]:
@@ -3202,6 +3525,15 @@ def build_reply(user_id: str, text: str) -> str:
     if state.get("sync_pending"):
         schedule_pending_sheet_sync(user_id)
 
+    order_token = extract_order_token(text)
+    if order_token:
+        payload = consume_any_order_token_record(order_token)
+        if not payload:
+            return "I couldn’t open that order token. Please place the order again from the website."
+        reply = load_order_from_token_payload(user_id, state, payload)
+        save_state(user_id, state)
+        return reply
+
     if not state["greeted"]:
         state["greeted"] = True
         state["stage"] = STAGE_MAIN_MENU
@@ -3265,9 +3597,70 @@ def extract_message_payload(payload: Dict[str, Any]) -> Optional[Tuple[str, str,
         return None
 
 
+def cors_json_response(payload: Dict[str, Any], status: int = 200) -> Tuple[Any, int]:
+    response = jsonify(payload)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    return response, status
+
+
 @app.get("/")
 def healthcheck() -> Tuple[Any, int]:
     return jsonify({"status": "ok", "service": "Agnikara Restaurant AI"}), 200
+
+
+@app.route("/api/order-token", methods=["POST", "OPTIONS"])
+def create_order_token_api() -> Tuple[Any, int]:
+    if request.method == "OPTIONS":
+        return cors_json_response({"status": "ok"})
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        token_payload = build_validated_order_token_payload(payload)
+        token = token_payload["order_token"]
+        create_order_token_record(token_payload)
+        append_google_sheet_row(
+            GOOGLE_SHEETS_EVENT_SHEET,
+            [
+                utc_now().isoformat(),
+                "website",
+                "website_order_token_created",
+                token_payload.get("order_id", ""),
+                token,
+                token_payload["profile"].get("name", ""),
+                token_payload["profile"].get("mobile", ""),
+                token_payload["profile"].get("email", ""),
+                token_payload["profile"].get("service_type", ""),
+                token_payload["profile"].get("preferred_time", ""),
+                token_payload["profile"].get("guests", ""),
+                token_payload["total"],
+                token_payload["currency"],
+                "",
+                "",
+                "",
+                "",
+                json.dumps(token_payload),
+            ],
+        )
+        append_google_sheet_row(
+            GOOGLE_SHEETS_ORDER_SHEET,
+            build_order_sheet_row_from_token_payload(token_payload, "website_order_token_created"),
+        )
+        return cors_json_response(
+            {
+                "status": "ok",
+                "token": token,
+                "total": token_payload["total"],
+                "item_count": int(token_payload.get("item_count", 0)),
+                "order_id": token_payload.get("order_id", ""),
+                "items_summary": token_payload.get("items_summary", ""),
+            }
+        )
+    except ValueError as exc:
+        return cors_json_response({"status": "error", "message": str(exc)}, 400)
+    except Exception:
+        return cors_json_response({"status": "error", "message": "token_generation_failed"}, 500)
 
 
 @app.get("/debug/sheets")

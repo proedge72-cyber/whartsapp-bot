@@ -1068,6 +1068,30 @@ def build_validated_order_message(validated: Dict[str, Any], total: Decimal) -> 
     return "\n".join(lines)
 
 
+def build_contextual_validated_order_message(validated: Dict[str, Any], total: Decimal, state: Dict[str, Any]) -> str:
+    base_message = build_validated_order_message(validated, total)
+    customer_name = state.get("customer_profile", {}).get("name", "").strip()
+    modifiers = state.get("customer_profile", {}).get("preferences", {}).get("modifiers", [])
+    temp_order = {
+        "items": [
+            {"name": item["item_name"], "qty": item["quantity"], "price": item["line_total"]}
+            for item in validated.get("corrected_items", [])
+        ]
+    }
+    suggestions = suggest_items(get_user_context(state), temp_order)
+
+    extra_lines: List[str] = []
+    if customer_name:
+        extra_lines.append(f"{customer_name}, I’ve checked your order against the menu.")
+    if modifiers:
+        extra_lines.append(f"Saved preferences active: {', '.join(modifiers)}.")
+    if suggestions:
+        extra_lines.append(suggestions[0])
+    if not extra_lines:
+        return base_message
+    return "\n".join(extra_lines + ["", base_message])
+
+
 def detect_order_message(text: str) -> bool:
     lowered = text.lower()
     return (
@@ -1581,6 +1605,17 @@ def generate_order_summary(order: Dict[str, Any], state: Optional[Dict[str, Any]
         [
             "",
             f"Total \u2014 {money_to_text(order.get('total', Decimal('0.00')), currency)}",
+        ]
+    )
+    if state is not None:
+        modifiers = state.get("customer_profile", {}).get("preferences", {}).get("modifiers", [])
+        if modifiers:
+            lines.extend(["", f"Saved preferences: {', '.join(modifiers)}"])
+        suggestions = suggest_items(get_user_context(state), order)
+        if suggestions:
+            lines.extend(["", suggestions[0]])
+    lines.extend(
+        [
             "",
             "What would you like to do?",
             "1. Confirm Order",
@@ -2049,6 +2084,8 @@ def greeting_message_for_state(state: Dict[str, Any]) -> str:
 
 
 def order_instruction_message(state: Dict[str, Any]) -> str:
+    customer_name = state.get("customer_profile", {}).get("name", "").strip()
+    favorite_items = get_user_context(state).get("most_frequent_items", [])
     intro = choose_variant(
         state,
         "order_instruction_intro",
@@ -2068,10 +2105,18 @@ def order_instruction_message(state: Dict[str, Any]) -> str:
             "Build your order \u2192 Checkout \u2192 Share it here.",
         ],
     )
-    return f"{intro}\n\nExplore our menu:\n{MENU_URL}\n\n{closing}"
+    lines = [intro]
+    if customer_name:
+        lines.extend(["", f"Welcome back, {customer_name}."])
+    if favorite_items:
+        lines.extend(["", f"Your usual picks include {', '.join(favorite_items[:2])}."])
+    lines.extend(["", f"Explore our menu:\n{MENU_URL}", "", closing])
+    return "\n".join(lines)
 
 
 def payment_prompt_message(state: Dict[str, Any]) -> str:
+    customer_name = state.get("customer_profile", {}).get("name", "").strip()
+    total = money_to_text(state.get("order", {}).get("total", Decimal("0.00")), state.get("order", {}).get("currency", DEFAULT_CURRENCY))
     intro = choose_variant(
         state,
         "payment_prompt",
@@ -2082,7 +2127,9 @@ def payment_prompt_message(state: Dict[str, Any]) -> str:
             "How would you like to settle this order?",
         ],
     )
-    return f"{intro}\n\n1. Pay Online \U0001f4b3\n2. Pay at Counter"
+    if customer_name:
+        intro = f"{customer_name}, {intro.lower()}"
+    return f"{intro}\n\nCurrent total: {total}\n\n1. Pay Online \U0001f4b3\n2. Pay at Counter"
 
 
 def handoff_message() -> str:
@@ -2463,7 +2510,7 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         corrected_items = validated["corrected_items"]
         if not corrected_items:
             state["failure_count"] += 1
-            return build_validated_order_message(validated, Decimal("0.00"))
+            return build_contextual_validated_order_message(validated, Decimal("0.00"), state)
 
         if not state.get("active_order_id") or state.get("payment_status") == "done" or state.get("order_stage") in {"preparing", "served"}:
             start_new_order(state, user_id)
@@ -2492,7 +2539,7 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         state["failure_count"] = 0
         sync_active_order_record(state)
         append_sheet_log(user_id, state, "order_validated")
-        return build_validated_order_message(validated, state["order"]["total"])
+        return build_contextual_validated_order_message(validated, state["order"]["total"], state)
     if intent == "order_status":
         order_ids = sorted_order_ids(state)
         if len(order_ids) > 1 and not resolve_order_reference(state, text):
@@ -2661,7 +2708,7 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
                 "fraud_detected": parsed.get("fraud_detected", False),
                 "submitted_total": parsed.get("submitted_total", Decimal("0.00")),
             }
-            return build_validated_order_message(validated_payload, state["order"]["total"])
+            return build_contextual_validated_order_message(validated_payload, state["order"]["total"], state)
         return generate_order_summary(state["order"], state)
     if state["stage"] in {STAGE_RESERVATION_DETAILS, STAGE_RESERVATION_CHECK}:
         return handle_reservation_stage(user_id, state, text)

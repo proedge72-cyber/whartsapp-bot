@@ -514,6 +514,12 @@ def create_default_state() -> Dict[str, Any]:
             "service_type": "",
             "preferred_time": "",
             "guests": "",
+            "preferences": {
+                "item_counts": {},
+                "category_counts": {},
+                "modifiers": [],
+                "time_slots": {},
+            },
         },
         "order_confirmed": False,
         "payment_status": "pending",
@@ -610,6 +616,12 @@ def get_state(user_id: str) -> Dict[str, Any]:
         state["last_completed_order_id"] = ""
     if "orders" not in state:
         state["orders"] = {}
+    profile = state.setdefault("customer_profile", {})
+    profile.setdefault("preferences", {})
+    profile["preferences"].setdefault("item_counts", {})
+    profile["preferences"].setdefault("category_counts", {})
+    profile["preferences"].setdefault("modifiers", [])
+    profile["preferences"].setdefault("time_slots", {})
     return state
 
 
@@ -669,7 +681,11 @@ def update_state_order_id(state: Dict[str, Any], new_order_id: str) -> None:
 def build_order_sheet_row(user_id: str, state: Dict[str, Any], event_type: str, timestamp: Optional[str] = None) -> List[str]:
     order = state.get("order", {})
     profile = state.get("customer_profile", {})
-    items_summary = ", ".join(f"{item.get('name', '')} x{item.get('qty', 0)}" for item in order.get("items", []))
+    items_summary = ", ".join(
+        f"{item.get('name', '')} x{item.get('qty', 0)}"
+        + (f" [{item.get('notes', '')}]" if item.get("notes") else "")
+        for item in order.get("items", [])
+    )
     return [
         timestamp or utc_now().isoformat(),
         order.get("order_id", ""),
@@ -1200,17 +1216,340 @@ def update_customer_profile(state: Dict[str, Any], profile_data: Dict[str, str])
         state["order"]["name"] = state["customer_profile"]["name"]
 
 
+def get_menu_category_map() -> Dict[str, str]:
+    category_map: Dict[str, str] = {}
+    for page in FIXED_MENU_PAGES.values():
+        for category in page["categories"]:
+            for item in category["items"]:
+                category_map[item["name"]] = category["name"]
+    return category_map
+
+
+MENU_CATEGORY_MAP = get_menu_category_map()
+
+
+def summarize_menu_for_ai(max_categories: int = 6, items_per_category: int = 4) -> str:
+    summary_lines: List[str] = []
+    for page in FIXED_MENU_PAGES.values():
+        for category in page["categories"][:max_categories]:
+            item_names = [item["name"] for item in category["items"][:items_per_category]]
+            summary_lines.append(f"{category['name']}: {', '.join(item_names)}")
+            if len(summary_lines) >= max_categories:
+                return "\n".join(summary_lines)
+    return "\n".join(summary_lines)
+
+
+def get_last_completed_order(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    last_order_id = state.get("last_completed_order_id", "")
+    if last_order_id:
+        return deepcopy(state.get("orders", {}).get(last_order_id) or {})
+    order_ids = sorted_order_ids(state)
+    for order_id in reversed(order_ids):
+        record = state.get("orders", {}).get(order_id) or {}
+        if record.get("confirmed_at"):
+            return deepcopy(record)
+    return None
+
+
+def get_user_context(state: Dict[str, Any]) -> Dict[str, Any]:
+    orders = state.get("orders", {})
+    last_order = get_last_completed_order(state) or {}
+    preferences = deepcopy(state.get("customer_profile", {}).get("preferences", {}))
+    item_counts: Dict[str, int] = {}
+    for record in orders.values():
+        for item in record.get("items", []):
+            item_name = item.get("name", "")
+            if not item_name:
+                continue
+            item_counts[item_name] = item_counts.get(item_name, 0) + int(item.get("qty", 0) or 0)
+
+    most_frequent_items = [
+        item_name
+        for item_name, _ in sorted(item_counts.items(), key=lambda pair: (-pair[1], pair[0]))[:3]
+    ]
+    last_order_items = [
+        {
+            "name": item.get("name", ""),
+            "qty": item.get("qty", 0),
+            "notes": item.get("notes", ""),
+        }
+        for item in last_order.get("items", [])
+    ]
+    preference_modifiers = preferences.get("modifiers", [])
+    preferred_categories = [
+        category
+        for category, _ in sorted(
+            preferences.get("category_counts", {}).items(),
+            key=lambda pair: (-pair[1], pair[0]),
+        )[:2]
+    ]
+    return {
+        "last_order_items": last_order_items,
+        "most_frequent_items": most_frequent_items,
+        "last_order_time": last_order.get("confirmed_at"),
+        "user_preferences": {
+            "modifiers": preference_modifiers,
+            "preferred_categories": preferred_categories,
+            "favorite_items": most_frequent_items,
+        },
+    }
+
+
+def extract_preference_note(message: str) -> str:
+    lowered = normalize_text(message).lower()
+    known_preferences = [
+        "no spicy",
+        "less spicy",
+        "extra spicy",
+        "less oil",
+        "no onion",
+        "no garlic",
+        "no sugar",
+        "less salt",
+    ]
+    for preference in known_preferences:
+        if preference in lowered:
+            return preference
+    return ""
+
+
+def attach_preference_to_order(state: Dict[str, Any], note: str) -> bool:
+    if not note or not state.get("order", {}).get("items"):
+        return False
+    updated = False
+    for item in state["order"]["items"]:
+        existing_note = str(item.get("notes", "")).strip()
+        if note in existing_note:
+            continue
+        item["notes"] = f"{existing_note}; {note}".strip("; ").strip()
+        updated = True
+    return updated
+
+
+def store_user_preference(state: Dict[str, Any], note: str) -> None:
+    if not note:
+        return
+    preferences = state.setdefault("customer_profile", {}).setdefault("preferences", {})
+    modifiers = preferences.setdefault("modifiers", [])
+    if note not in modifiers:
+        modifiers.append(note)
+
+
+def apply_saved_preferences_to_order(state: Dict[str, Any]) -> None:
+    modifiers = state.get("customer_profile", {}).get("preferences", {}).get("modifiers", [])
+    for note in modifiers:
+        attach_preference_to_order(state, note)
+
+
+def format_order_items_with_notes(items: List[Dict[str, Any]]) -> List[str]:
+    lines: List[str] = []
+    for item in items:
+        note = str(item.get("notes", "")).strip()
+        line = f"* {item.get('name', '')} x{item.get('qty', 0)}"
+        if note:
+            line += f" ({note})"
+        lines.append(line)
+    return lines
+
+
+def format_reorder_message(state: Dict[str, Any]) -> Optional[str]:
+    last_order = get_last_completed_order(state)
+    if not last_order or not last_order.get("items"):
+        return None
+    lines = ["Repeating your last order:", ""]
+    lines.extend(format_order_items_with_notes(last_order["items"]))
+    lines.extend(["", "Reply YES to confirm or MODIFY to change."])
+    return "\n".join(lines)
+
+
+def load_last_order_into_cart(state: Dict[str, Any], user_id: str) -> bool:
+    last_order = get_last_completed_order(state)
+    if not last_order or not last_order.get("items"):
+        return False
+    if not state.get("active_order_id") or state.get("payment_status") == "done" or state.get("order_stage") in {"preparing", "served"}:
+        start_new_order(state, user_id)
+    state["intent"] = "order"
+    state["waiting_for_order"] = False
+    state["checkout_mode"] = "append"
+    state["order"] = {
+        "order_id": state.get("active_order_id", ""),
+        "name": state.get("customer_profile", {}).get("name", last_order.get("name", "")),
+        "items": deepcopy(last_order.get("items", [])),
+        "total": last_order.get("total", Decimal("0.00")),
+        "currency": last_order.get("currency", DEFAULT_CURRENCY),
+    }
+    apply_saved_preferences_to_order(state)
+    state["order_confirmed"] = False
+    state["payment_status"] = "pending"
+    state["payment_method"] = ""
+    state["payment_link"] = ""
+    state["payment_link_id"] = ""
+    state["payment_verification_attempts"] = 0
+    set_stage(state, STAGE_ORDER_ACTION)
+    sync_active_order_record(state)
+    return True
+
+
+def suggest_items(context: Dict[str, Any], current_order: Dict[str, Any]) -> List[str]:
+    items = current_order.get("items", [])
+    if not items:
+        return []
+    item_names = {str(item.get("name", "")) for item in items}
+    suggestions: List[str] = []
+    mains = {"Butter Chicken", "Tikka Masala Classico", "Chicken Biryani", "Lamb Biryani", "Prawn Biryani", "Paneer Butter Masala"}
+    sides = {"Naan", "Butter Naan", "Garlic Naan", "Jeera Rice", "Steamed Basmati Rice"}
+    drinks = {"Mango Lassi", "Masala Tea", "Lemon Soda", "Coca-Cola"}
+    desserts = {"Gulab Jamun Caldo", "Tiramisu Classico", "Jalebi", "Gelato"}
+    heavy_keywords = ("Biryani", "Butter", "Korma", "Madras", "Tikka", "Lamb", "Prawn")
+
+    if any(name in mains for name in item_names) and not any(name in sides for name in item_names):
+        suggestions.append("You might like Garlic Naan or Jeera Rice with this. Want me to add one?")
+    if any(keyword.lower() in name.lower() for name in item_names for keyword in heavy_keywords) and not any(name in drinks for name in item_names):
+        suggestions.append("Mango Lassi would go nicely with this order. Want me to add it?")
+    if not any(name in desserts for name in item_names):
+        suggestions.append("If you'd like something sweet after this, Gulab Jamun Caldo is a nice finish.")
+    return suggestions[:2]
+
+
+def build_contextual_update_message(state: Dict[str, Any], item_name: str) -> str:
+    customer_name = state.get("customer_profile", {}).get("name", "").strip()
+    favorite_items = get_user_context(state).get("most_frequent_items", [])
+    if customer_name and item_name in favorite_items:
+        return f"Nice choice again, {customer_name}. I've added {item_name} to your order."
+    if customer_name:
+        return f"Nice choice, {customer_name}. I've added {item_name} to your order."
+    return f"I've added {item_name} to your order."
+
+
+def detect_intent_with_context(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    lowered = normalize_text(message).lower()
+    preference_note = extract_preference_note(message)
+    if preference_note:
+        return {"intent": "remove_preference", "preference_note": preference_note}
+    if lowered in {"repeat", "repeat last order", "same as last time", "reorder", "reorder last"}:
+        return {"intent": "reorder_last"}
+    if any(phrase in lowered for phrase in {"suggest", "recommend", "what should i add", "any suggestion"}):
+        return {"intent": "suggest_items"}
+    if lowered in {"hello", "hi", "hey"}:
+        return {"intent": "greeting"}
+    if lowered.startswith(("remove ", "change ", "update ", "set ")):
+        return {"intent": "modify_existing_order"}
+    if detect_order_message(message) or detect_validatable_order_message(message):
+        return {"intent": "general_order"}
+    if not openai_client:
+        return {"intent": "unknown"}
+
+    context = get_user_context(state)
+    current_cart = {
+        "items": [
+            {"name": item.get("name", ""), "qty": item.get("qty", 0), "notes": item.get("notes", "")}
+            for item in state.get("order", {}).get("items", [])
+        ]
+    }
+    system_prompt = (
+        "Classify the user's message for a restaurant ordering assistant. "
+        "Return only JSON with schema "
+        '{"intent":"reorder_last|remove_preference|suggest_items|modify_existing_order|general_order|greeting|unknown","preference_note":"string"}'
+        ". AI must not change prices, bypass validation, or invent menu items."
+    )
+    try:
+        response = openai_client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": f"Last order: {json.dumps(context.get('last_order_items', []), default=str)}"},
+                {"role": "system", "content": f"Current cart: {json.dumps(current_cart, default=str)}"},
+                {"role": "system", "content": f"Menu summary:\n{summarize_menu_for_ai()}"},
+                {"role": "user", "content": message},
+            ],
+            max_output_tokens=120,
+        )
+        parsed = json_from_text(response.output_text) or {"intent": "unknown"}
+        if parsed.get("intent") not in {
+            "reorder_last",
+            "remove_preference",
+            "suggest_items",
+            "modify_existing_order",
+            "general_order",
+            "greeting",
+            "unknown",
+        }:
+            parsed["intent"] = "unknown"
+        if not parsed.get("preference_note") and preference_note:
+            parsed["preference_note"] = preference_note
+        return parsed
+    except Exception as exc:
+        logger.warning("Context-aware intent detection failed: %s", exc)
+        return {"intent": "unknown"}
+
+
+def handle_context_intent(user_id: str, state: Dict[str, Any], message: str, context_intent: Dict[str, Any]) -> Optional[str]:
+    intent = context_intent.get("intent", "unknown")
+    if state.get("stage") in {STAGE_PAYMENT_CHOICE, STAGE_PAYMENT_CONFIRMATION, STAGE_RESERVATION_DETAILS, STAGE_RESERVATION_CHECK}:
+        return None
+    if intent == "greeting" and not state.get("order", {}).get("items"):
+        return greeting_message_for_state(state)
+    if intent == "reorder_last":
+        return format_reorder_message(state) or "I don't have a completed order to repeat yet."
+    if intent == "remove_preference":
+        note = context_intent.get("preference_note") or extract_preference_note(message)
+        if not note:
+            return None
+        store_user_preference(state, note)
+        if attach_preference_to_order(state, note):
+            sync_active_order_record(state)
+            return f"Noted. I'll keep this order as '{note}'."
+        return f"Noted. I'll remember '{note}' for your next order too."
+    if intent == "suggest_items":
+        suggestions = suggest_items(get_user_context(state), state.get("order", {}))
+        if suggestions:
+            return suggestions[0]
+    if intent == "modify_existing_order" and state.get("order", {}).get("items"):
+        updated, changed = modify_order_from_text(state["order"], message)
+        if changed:
+            state["order"] = updated
+            set_stage(state, STAGE_ORDER_ACTION)
+            sync_active_order_record(state)
+            return generate_order_summary(state["order"], state)
+    return None
+
+
+def learn_from_confirmed_order(state: Dict[str, Any]) -> None:
+    preferences = state.setdefault("customer_profile", {}).setdefault("preferences", {})
+    item_counts = preferences.setdefault("item_counts", {})
+    category_counts = preferences.setdefault("category_counts", {})
+    time_slots = preferences.setdefault("time_slots", {})
+    modifiers = preferences.setdefault("modifiers", [])
+
+    for item in state.get("order", {}).get("items", []):
+        item_name = item.get("name", "")
+        if item_name:
+            item_counts[item_name] = item_counts.get(item_name, 0) + int(item.get("qty", 0) or 0)
+        category_name = MENU_CATEGORY_MAP.get(item_name)
+        if category_name:
+            category_counts[category_name] = category_counts.get(category_name, 0) + 1
+        note = str(item.get("notes", "")).strip()
+        if note and note not in modifiers:
+            modifiers.append(note)
+
+    preferred_time = state.get("customer_profile", {}).get("preferred_time", "").strip()
+    if preferred_time:
+        time_slots[preferred_time] = time_slots.get(preferred_time, 0) + 1
+
+
 def generate_order_summary(order: Dict[str, Any], state: Optional[Dict[str, Any]] = None) -> str:
     name = order.get("name") or "there"
     currency = order.get("currency", DEFAULT_CURRENCY)
     if state is None:
         intro = f"Here\u2019s your updated order, {name} \U0001f60f"
     else:
+        favorite_items = get_user_context(state).get("most_frequent_items", [])
+        has_favorite = any(item.get("name") in favorite_items for item in order.get("items", []))
         intro = choose_variant(
             state,
             "order_summary_intro",
             [
-                f"Here\u2019s your updated order, {name} \U0001f60f",
+                f"Nice choice, {name}. Here\u2019s your updated order \U0001f60f" if has_favorite else f"Here\u2019s your updated order, {name} \U0001f60f",
                 f"This is your updated order, {name} \U0001f60f",
                 f"Your latest order looks like this, {name} \U0001f60f",
             ],
@@ -1230,12 +1569,13 @@ def generate_order_summary(order: Dict[str, Any], state: Optional[Dict[str, Any]
         state.setdefault("response_counters", {})["order_detail_style"] = state.get("response_counters", {}).get("order_detail_style", 0) + 1
 
     for item in order.get("items", []):
+        note_suffix = f" ({item['notes']})" if item.get("notes") else ""
         if detail_style == 0:
-            line = f"{item['name']} x{item['qty']} \u2014 {money_to_text(item['price'], currency)}"
+            line = f"{item['name']}{note_suffix} x{item['qty']} \u2014 {money_to_text(item['price'], currency)}"
         elif detail_style == 1:
-            line = f"\u2022 {item['name']} | Qty {item['qty']} | {money_to_text(item['price'], currency)}"
+            line = f"\u2022 {item['name']}{note_suffix} | Qty {item['qty']} | {money_to_text(item['price'], currency)}"
         else:
-            line = f"- {item['qty']} x {item['name']} for {money_to_text(item['price'], currency)}"
+            line = f"- {item['qty']} x {item['name']}{note_suffix} for {money_to_text(item['price'], currency)}"
         lines.append(line)
     lines.extend(
         [
@@ -1298,12 +1638,13 @@ def generate_final_order_summary(state: Dict[str, Any]) -> str:
     state.setdefault("response_counters", {})["final_detail_style"] = state.get("response_counters", {}).get("final_detail_style", 0) + 1
 
     for item in order.get("items", []):
+        note_suffix = f" ({item['notes']})" if item.get("notes") else ""
         if detail_style == 0:
-            lines.append(f"\u2022 {item['name']} x{item['qty']} \u2014 {money_to_text(item['price'], currency)}")
+            lines.append(f"\u2022 {item['name']}{note_suffix} x{item['qty']} \u2014 {money_to_text(item['price'], currency)}")
         elif detail_style == 1:
-            lines.append(f"- {item['qty']} x {item['name']} | {money_to_text(item['price'], currency)}")
+            lines.append(f"- {item['qty']} x {item['name']}{note_suffix} | {money_to_text(item['price'], currency)}")
         else:
-            lines.append(f"{item['name']} | Qty {item['qty']} | {money_to_text(item['price'], currency)}")
+            lines.append(f"{item['name']}{note_suffix} | Qty {item['qty']} | {money_to_text(item['price'], currency)}")
 
     lines.extend(
         [
@@ -1340,7 +1681,8 @@ def generate_tracked_order_summary(record: Dict[str, Any], state: Dict[str, Any]
     lines.append("")
     lines.append("Items:")
     for item in record.get("items", []):
-        lines.append(f"- {item['name']} x{item['qty']} | {money_to_text(item['price'], currency)}")
+        note_suffix = f" ({item['notes']})" if item.get("notes") else ""
+        lines.append(f"- {item['name']}{note_suffix} x{item['qty']} | {money_to_text(item['price'], currency)}")
     lines.append("")
     lines.append(f"Total: {money_to_text(record.get('total', Decimal('0.00')), currency)}")
     return "\n".join(lines)
@@ -1895,6 +2237,7 @@ def finalize_confirmation(state: Dict[str, Any]) -> None:
     state["payment_pending_since"] = None
     if state.get("active_order_id"):
         state["last_completed_order_id"] = state["active_order_id"]
+    learn_from_confirmed_order(state)
     sync_active_order_record(state)
 
 
@@ -2138,6 +2481,7 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
             "total": calculate_total(corrected_items),
             "currency": DEFAULT_CURRENCY,
         }
+        apply_saved_preferences_to_order(state)
         state["order_confirmed"] = False
         state["payment_status"] = "pending"
         state["payment_method"] = ""
@@ -2286,6 +2630,7 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         else:
             state["order"] = merge_orders(state["order"], parsed)
             state["order"]["order_id"] = state.get("active_order_id", state["order"].get("order_id", ""))
+        apply_saved_preferences_to_order(state)
         update_customer_profile(state, parsed.get("profile", {}))
         state["order"]["name"] = state.get("customer_profile", {}).get("name", state["order"].get("name", ""))
         state["order_confirmed"] = False
@@ -2338,6 +2683,24 @@ def build_reply(user_id: str, text: str) -> str:
             return f"{initial}\n\n{follow_up}"
         save_state(user_id, state)
         return greeting_message_for_state(state)
+
+    lowered = text.strip().lower()
+    if lowered == "yes" and state.get("last_ai_action") == "reorder_last":
+        if load_last_order_into_cart(state, user_id):
+            save_state(user_id, state)
+            return generate_order_summary(state["order"], state)
+    if lowered == "modify" and state.get("last_ai_action") == "reorder_last":
+        if load_last_order_into_cart(state, user_id):
+            set_stage(state, STAGE_ORDER_ACTION)
+            save_state(user_id, state)
+            return "I’ve loaded your last order. Tell me the change in one line."
+
+    context_intent = detect_intent_with_context(text, state)
+    context_reply = handle_context_intent(user_id, state, text, context_intent)
+    if context_reply:
+        state["last_ai_action"] = context_intent.get("intent", "")
+        save_state(user_id, state)
+        return context_reply
 
     decision = classify_intent(text, state)
     state["last_ai_action"] = decision.get("action", "")

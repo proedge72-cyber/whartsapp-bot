@@ -534,6 +534,7 @@ def create_default_state() -> Dict[str, Any]:
         "handoff_requested": False,
         "failure_count": 0,
         "last_ai_action": "",
+        "pending_suggested_item": "",
         "response_counters": {},
         "last_message_at": None,
         "confirmed_at": None,
@@ -616,6 +617,8 @@ def get_state(user_id: str) -> Dict[str, Any]:
         state["last_completed_order_id"] = ""
     if "orders" not in state:
         state["orders"] = {}
+    if "pending_suggested_item" not in state:
+        state["pending_suggested_item"] = ""
     profile = state.setdefault("customer_profile", {})
     profile.setdefault("preferences", {})
     profile["preferences"].setdefault("item_counts", {})
@@ -1435,6 +1438,65 @@ def suggest_items(context: Dict[str, Any], current_order: Dict[str, Any]) -> Lis
     return suggestions[:2]
 
 
+def get_structured_suggestions(context: Dict[str, Any], current_order: Dict[str, Any]) -> List[Dict[str, str]]:
+    items = current_order.get("items", [])
+    if not items:
+        return []
+    item_names = {str(item.get("name", "")) for item in items}
+    suggestions: List[Dict[str, str]] = []
+    mains = {"Butter Chicken", "Tikka Masala Classico", "Chicken Biryani", "Lamb Biryani", "Prawn Biryani", "Paneer Butter Masala"}
+    sides = {"Naan", "Butter Naan", "Garlic Naan", "Jeera Rice", "Steamed Basmati Rice"}
+    drinks = {"Mango Lassi", "Masala Tea", "Lemon Soda", "Coca-Cola"}
+    desserts = {"Gulab Jamun Caldo", "Tiramisu Classico", "Jalebi", "Gelato"}
+    heavy_keywords = ("Biryani", "Butter", "Korma", "Madras", "Tikka", "Lamb", "Prawn")
+
+    if any(name in mains for name in item_names) and not any(name in sides for name in item_names):
+        suggestions.append({"item_name": "Garlic Naan", "message": "You might like Garlic Naan with this. Want me to add it?"})
+    if any(keyword.lower() in name.lower() for name in item_names for keyword in heavy_keywords) and not any(name in drinks for name in item_names):
+        suggestions.append({"item_name": "Mango Lassi", "message": "Mango Lassi would go nicely with this order. Want me to add it?"})
+    if not any(name in desserts for name in item_names):
+        suggestions.append({"item_name": "Gulab Jamun Caldo", "message": "If you'd like something sweet after this, Gulab Jamun Caldo is a nice finish. Want me to add it?"})
+    return suggestions[:2]
+
+
+def add_menu_item_to_current_order(state: Dict[str, Any], item_name: str, qty: int = 1) -> bool:
+    menu_item = find_menu_item(item_name)
+    if not menu_item:
+        return False
+    if not state.get("order", {}).get("items"):
+        return False
+    incoming_order = {
+        "items": [
+            {
+                "name": menu_item["name"],
+                "qty": qty,
+                "price": normalize_price(menu_item["price"]) * qty,
+            }
+        ],
+        "currency": state.get("order", {}).get("currency", DEFAULT_CURRENCY),
+    }
+    state["order"] = merge_orders(state["order"], incoming_order)
+    state["order"]["order_id"] = state.get("active_order_id", state["order"].get("order_id", ""))
+    apply_saved_preferences_to_order(state)
+    set_stage(state, STAGE_ORDER_ACTION)
+    sync_active_order_record(state)
+    state["pending_suggested_item"] = ""
+    return True
+
+
+def maybe_accept_suggested_item(state: Dict[str, Any], message: str) -> Optional[str]:
+    suggested_item = state.get("pending_suggested_item", "").strip()
+    if not suggested_item or not state.get("order", {}).get("items"):
+        return None
+    lowered = normalize_text(message).lower()
+    accepts = {"yes", "ok", "okay", "sure", "add it", "add that", "yes add it", "go ahead", "add"}
+    if lowered not in accepts and suggested_item.lower() not in lowered:
+        return None
+    if add_menu_item_to_current_order(state, suggested_item):
+        return build_contextual_update_message(state, suggested_item) + "\n\n" + generate_order_summary(state["order"], state)
+    return None
+
+
 def build_contextual_update_message(state: Dict[str, Any], item_name: str) -> str:
     customer_name = state.get("customer_profile", {}).get("name", "").strip()
     favorite_items = get_user_context(state).get("most_frequent_items", [])
@@ -1525,9 +1587,10 @@ def handle_context_intent(user_id: str, state: Dict[str, Any], message: str, con
             return f"Noted. I'll keep this order as '{note}'."
         return f"Noted. I'll remember '{note}' for your next order too."
     if intent == "suggest_items":
-        suggestions = suggest_items(get_user_context(state), state.get("order", {}))
+        suggestions = get_structured_suggestions(get_user_context(state), state.get("order", {}))
         if suggestions:
-            return suggestions[0]
+            state["pending_suggested_item"] = suggestions[0]["item_name"]
+            return suggestions[0]["message"]
     if intent == "modify_existing_order" and state.get("order", {}).get("items"):
         updated, changed = modify_order_from_text(state["order"], message)
         if changed:
@@ -2299,6 +2362,7 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
         state["failure_count"] = 0
         return greeting_message_for_state(state)
     if action == "show_menu_link":
+        state["pending_suggested_item"] = ""
         state["intent"] = "order"
         if not state.get("active_order_id") or state.get("payment_status") == "done" or state.get("order_stage") in {"preparing", "served"}:
             start_new_order(state, user_id)
@@ -2312,10 +2376,12 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
         state["failure_count"] = 0
         return generate_order_summary(state["order"], state)
     if action == "confirm_order" and state["order"]["items"]:
+        state["pending_suggested_item"] = ""
         set_stage(state, STAGE_PAYMENT_CHOICE)
         state["failure_count"] = 0
         return payment_prompt_message(state)
     if action == "add_more_items":
+        state["pending_suggested_item"] = ""
         set_stage(state, STAGE_CHECKOUT)
         state["waiting_for_order"] = True
         state["checkout_mode"] = "replace"
@@ -2330,6 +2396,7 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
             ],
         )
     if action == "modify_order":
+        state["pending_suggested_item"] = ""
         set_stage(state, STAGE_ORDER_ACTION)
         state["failure_count"] = 0
         return choose_variant(
@@ -2730,6 +2797,12 @@ def build_reply(user_id: str, text: str) -> str:
             return f"{initial}\n\n{follow_up}"
         save_state(user_id, state)
         return greeting_message_for_state(state)
+
+    suggestion_reply = maybe_accept_suggested_item(state, text)
+    if suggestion_reply:
+        state["last_ai_action"] = "accept_suggested_item"
+        save_state(user_id, state)
+        return suggestion_reply
 
     lowered = text.strip().lower()
     if lowered == "yes" and state.get("last_ai_action") == "reorder_last":

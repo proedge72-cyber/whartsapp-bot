@@ -917,20 +917,33 @@ def parse_order_message(text: str) -> Optional[Dict[str, Any]]:
         flags=re.IGNORECASE,
     )
     item_pattern = re.compile(
-        r"^\s*[*\-\u2022]?\s*(?P<name>.+?)\s*x(?P<qty>\d+)(?:\s*\([\u20ac\u20b9]?[0-9]+(?:[.,][0-9]{1,2})?\s*each\))?\s*=\s*[\u20ac\u20b9]?\s*(?P<price>[0-9]+(?:[.,][0-9]{1,2})?)\s*$",
+        r"^\s*[*\-\u2022]?\s*(?P<name>.+?)\s*x(?P<qty>\d+)(?:\s*\([^\d]*?(?P<each>[0-9]+(?:[.,][0-9]{1,2})?(?:/[0-9]+(?:[.,][0-9]{1,2})?)?)\s*each\))?\s*=\s*[^\d]?\s*(?P<price>[0-9]+(?:[.,][0-9]{1,2})?)\s*$",
         flags=re.IGNORECASE,
     )
 
     items: List[Dict[str, Any]] = []
+    invalid_items: List[str] = []
+    fraud_detected = False
     for line in normalized.splitlines():
         match = item_pattern.match(line.strip())
         if not match:
             continue
+        item_name = match.group("name").strip()
+        quantity = int(match.group("qty"))
+        user_line_price = parse_decimal(match.group("price"))
+        menu_item = find_menu_item(item_name)
+        if not menu_item:
+            invalid_items.append(item_name)
+            continue
+        real_unit_price = normalize_price(menu_item["price"])
+        corrected_line_price = (real_unit_price * quantity).quantize(Decimal("0.01"))
+        if user_line_price.quantize(Decimal("0.01")) != corrected_line_price:
+            fraud_detected = True
         items.append(
             {
-                "name": match.group("name").strip(),
-                "qty": int(match.group("qty")),
-                "price": parse_decimal(match.group("price")),
+                "name": menu_item["name"],
+                "qty": quantity,
+                "price": corrected_line_price,
             }
         )
 
@@ -940,13 +953,17 @@ def parse_order_message(text: str) -> Optional[Dict[str, Any]]:
     currency = "EUR" if "\u20ac" in normalized else DEFAULT_CURRENCY
     derived_total = sum((item["price"] for item in items), Decimal("0.00"))
     parsed_total = parse_decimal(total_match.group(1)) if total_match else derived_total
+    if parsed_total.quantize(Decimal("0.01")) != derived_total.quantize(Decimal("0.01")):
+        fraud_detected = True
     name_value = fields["name"].group(1).strip() if fields["name"] else ""
 
     return {
         "name": name_value,
         "items": items,
-        "total": parsed_total if parsed_total > 0 else derived_total,
+        "total": derived_total,
         "currency": currency,
+        "fraud_detected": fraud_detected,
+        "invalid_items": invalid_items,
         "profile": {
             "name": name_value,
             "mobile": fields["mobile"].group(1).strip() if fields["mobile"] else "",
@@ -2117,7 +2134,24 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         set_stage(state, STAGE_ORDER_ACTION)
         state["failure_count"] = 0
         sync_active_order_record(state)
-        append_sheet_log(user_id, state, "order_updated")
+        event_type = "order_corrected" if parsed.get("fraud_detected") else "order_updated"
+        append_sheet_log(user_id, state, event_type)
+        if parsed.get("fraud_detected") or parsed.get("invalid_items"):
+            validated_payload = {
+                "corrected_items": [
+                    {
+                        "item_name": item["name"],
+                        "quantity": item["qty"],
+                        "user_price": Decimal("0.00"),
+                        "real_price": (item["price"] / item["qty"]) if item["qty"] else item["price"],
+                        "line_total": item["price"],
+                    }
+                    for item in state["order"]["items"]
+                ],
+                "invalid_items": parsed.get("invalid_items", []),
+                "fraud_detected": parsed.get("fraud_detected", False),
+            }
+            return build_validated_order_message(validated_payload, state["order"]["total"])
         return generate_order_summary(state["order"], state)
     if state["stage"] in {STAGE_RESERVATION_DETAILS, STAGE_RESERVATION_CHECK}:
         return handle_reservation_stage(user_id, state, text)

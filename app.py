@@ -656,6 +656,23 @@ def generate_tracked_order_summary(record: Dict[str, Any], state: Dict[str, Any]
     return "\n".join(lines)
 
 
+def recent_order_choices_message(state: Dict[str, Any]) -> str:
+    order_ids = sorted_order_ids(state)
+    if not order_ids:
+        return "I don’t have any saved orders to track yet."
+
+    recent_ids = list(reversed(order_ids[-3:]))
+    lines = ["Which order would you like to track?", ""]
+    for order_id in recent_ids:
+        record = get_order_record(state, order_id) or {}
+        status = str(record.get("order_stage", "none")).title()
+        total = money_to_text(record.get("total", Decimal("0.00")), record.get("currency", DEFAULT_CURRENCY))
+        lines.append(f"{order_id} — {status} — {total}")
+    lines.append("")
+    lines.append("Reply with the order ID or just the last 4 digits.")
+    return "\n".join(lines)
+
+
 def payment_success_message(state: Dict[str, Any]) -> str:
     return (
         "Payment received. Your order is now being prepared \U0001f37d\ufe0f\n\n"
@@ -1297,6 +1314,13 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
     if intent == "reservation_check":
         return execute_action(user_id, state, {"action": "check_reservation"}, text)
     if intent == "order_status":
+        order_ids = sorted_order_ids(state)
+        if len(order_ids) > 1 and not resolve_order_reference(state, text):
+            return recent_order_choices_message(state)
+        if len(order_ids) == 1:
+            record = get_order_record(state, order_ids[0])
+            if record:
+                return generate_tracked_order_summary(record, state)
         return execute_action(user_id, state, {"action": "check_order_stage"}, text)
     if intent == "confirm_order":
         return execute_action(user_id, state, {"action": "confirm_order"}, text)

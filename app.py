@@ -535,6 +535,7 @@ def create_default_state() -> Dict[str, Any]:
         "failure_count": 0,
         "last_ai_action": "",
         "pending_suggested_item": "",
+        "recent_suggestions": [],
         "response_counters": {},
         "last_message_at": None,
         "confirmed_at": None,
@@ -619,6 +620,8 @@ def get_state(user_id: str) -> Dict[str, Any]:
         state["orders"] = {}
     if "pending_suggested_item" not in state:
         state["pending_suggested_item"] = ""
+    if "recent_suggestions" not in state:
+        state["recent_suggestions"] = []
     profile = state.setdefault("customer_profile", {})
     profile.setdefault("preferences", {})
     profile["preferences"].setdefault("item_counts", {})
@@ -1090,7 +1093,7 @@ def build_contextual_validated_order_message(validated: Dict[str, Any], total: D
         extra_lines.append(f"Saved preferences active: {', '.join(modifiers)}.")
     structured_suggestions = get_structured_suggestions(get_user_context(state), temp_order)
     if structured_suggestions:
-        state["pending_suggested_item"] = structured_suggestions[0]["item_name"]
+        remember_suggested_item(state, structured_suggestions[0]["item_name"])
         extra_lines.append(structured_suggestions[0]["message"])
     elif suggestions:
         extra_lines.append(suggestions[0])
@@ -1318,6 +1321,7 @@ def get_user_context(state: Dict[str, Any]) -> Dict[str, Any]:
         "last_order_items": last_order_items,
         "most_frequent_items": most_frequent_items,
         "last_order_time": last_order.get("confirmed_at"),
+        "recent_suggestions": list(state.get("recent_suggestions", [])[-5:]),
         "user_preferences": {
             "modifiers": preference_modifiers,
             "preferred_categories": preferred_categories,
@@ -1422,24 +1426,7 @@ def load_last_order_into_cart(state: Dict[str, Any], user_id: str) -> bool:
 
 
 def suggest_items(context: Dict[str, Any], current_order: Dict[str, Any]) -> List[str]:
-    items = current_order.get("items", [])
-    if not items:
-        return []
-    item_names = {str(item.get("name", "")) for item in items}
-    suggestions: List[str] = []
-    mains = {"Butter Chicken", "Tikka Masala Classico", "Chicken Biryani", "Lamb Biryani", "Prawn Biryani", "Paneer Butter Masala"}
-    sides = {"Naan", "Butter Naan", "Garlic Naan", "Jeera Rice", "Steamed Basmati Rice"}
-    drinks = {"Mango Lassi", "Masala Tea", "Lemon Soda", "Coca-Cola"}
-    desserts = {"Gulab Jamun Caldo", "Tiramisu Classico", "Jalebi", "Gelato"}
-    heavy_keywords = ("Biryani", "Butter", "Korma", "Madras", "Tikka", "Lamb", "Prawn")
-
-    if any(name in mains for name in item_names) and not any(name in sides for name in item_names):
-        suggestions.append("You might like Garlic Naan or Jeera Rice with this. Want me to add one?")
-    if any(keyword.lower() in name.lower() for name in item_names for keyword in heavy_keywords) and not any(name in drinks for name in item_names):
-        suggestions.append("Mango Lassi would go nicely with this order. Want me to add it?")
-    if not any(name in desserts for name in item_names):
-        suggestions.append("If you'd like something sweet after this, Gulab Jamun Caldo is a nice finish.")
-    return suggestions[:2]
+    return [suggestion["message"] for suggestion in get_structured_suggestions(context, current_order)]
 
 
 def get_structured_suggestions(context: Dict[str, Any], current_order: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -1447,20 +1434,74 @@ def get_structured_suggestions(context: Dict[str, Any], current_order: Dict[str,
     if not items:
         return []
     item_names = {str(item.get("name", "")) for item in items}
-    suggestions: List[Dict[str, str]] = []
-    mains = {"Butter Chicken", "Tikka Masala Classico", "Chicken Biryani", "Lamb Biryani", "Prawn Biryani", "Paneer Butter Masala"}
-    sides = {"Naan", "Butter Naan", "Garlic Naan", "Jeera Rice", "Steamed Basmati Rice"}
-    drinks = {"Mango Lassi", "Masala Tea", "Lemon Soda", "Coca-Cola"}
-    desserts = {"Gulab Jamun Caldo", "Tiramisu Classico", "Jalebi", "Gelato"}
-    heavy_keywords = ("Biryani", "Butter", "Korma", "Madras", "Tikka", "Lamb", "Prawn")
+    item_categories = {MENU_CATEGORY_MAP.get(name, "") for name in item_names}
+    favorite_items = set(context.get("most_frequent_items", []))
+    recent_suggestions = set(context.get("recent_suggestions", []))
+    candidate_groups: List[List[Dict[str, str]]] = []
 
-    if any(name in mains for name in item_names) and not any(name in sides for name in item_names):
-        suggestions.append({"item_name": "Garlic Naan", "message": "You might like Garlic Naan with this. Want me to add it?"})
-    if any(keyword.lower() in name.lower() for name in item_names for keyword in heavy_keywords) and not any(name in drinks for name in item_names):
-        suggestions.append({"item_name": "Mango Lassi", "message": "Mango Lassi would go nicely with this order. Want me to add it?"})
-    if not any(name in desserts for name in item_names):
-        suggestions.append({"item_name": "Gulab Jamun Caldo", "message": "If you'd like something sweet after this, Gulab Jamun Caldo is a nice finish. Want me to add it?"})
-    return suggestions[:2]
+    bread_candidates = [
+        {"item_name": "Garlic Naan", "message": "Garlic Naan would round this order out nicely. Want me to add it?"},
+        {"item_name": "Butter Naan", "message": "Butter Naan would go really well with these curries. Want me to add it?"},
+        {"item_name": "Cheese Naan", "message": "Cheese Naan could make this feel extra satisfying. Want me to add it?"},
+    ]
+    rice_candidates = [
+        {"item_name": "Jeera Rice", "message": "Jeera Rice would pair nicely with this order. Want me to add it?"},
+        {"item_name": "Steamed Basmati Rice", "message": "A side of Steamed Basmati Rice would complete this plate well. Want me to add it?"},
+    ]
+    drink_candidates = [
+        {"item_name": "Mango Lassi", "message": "Mango Lassi would balance these flavors really well. Want me to add it?"},
+        {"item_name": "Lemon Soda", "message": "Lemon Soda would keep this order feeling fresh and balanced. Want me to add it?"},
+        {"item_name": "Masala Tea", "message": "Masala Tea could be a lovely finish with this meal. Want me to add it?"},
+    ]
+    dessert_candidates = [
+        {"item_name": "Gulab Jamun Caldo", "message": "Gulab Jamun Caldo would make this order feel complete. Want me to add it?"},
+        {"item_name": "Tiramisu Classico", "message": "Tiramisu Classico would be a nice sweet finish here. Want me to add it?"},
+        {"item_name": "Jalebi", "message": "A Jalebi on the side would add a cheerful sweet finish. Want me to add it?"},
+    ]
+    starter_candidates = [
+        {"item_name": "Punjabi Samosa Classic", "message": "Punjabi Samosa Classic would make a nice starter with this order. Want me to add it?"},
+        {"item_name": "Mix Pakoda Croccante", "message": "Mix Pakoda Croccante would be a good crunchy starter here. Want me to add it?"},
+    ]
+
+    has_curry = any(category in {"Piatti Vegetariani", "Piatti con Pollo", "Piatti con Agnello", "Piatti con Pesce"} for category in item_categories)
+    has_biryani = any("Biryani" in name for name in item_names)
+    has_bread = any(name in {"Naan", "Butter Naan", "Garlic Naan", "Cheese Naan", "Aloo Kulcha", "Amritsari Kulcha"} for name in item_names)
+    has_rice = any(name in {"Jeera Rice", "Steamed Basmati Rice", "Veg Biryani", "Chicken Biryani", "Lamb Biryani", "Prawn Biryani"} for name in item_names)
+    has_drink = any(MENU_CATEGORY_MAP.get(name) == "Bevande" for name in item_names)
+    has_dessert = any(MENU_CATEGORY_MAP.get(name) == "Dolci" for name in item_names)
+    has_starter = any(category in {"Antipasti Non Vegetariani", "Antipasti Vegetariani", "Agni's Street Specials"} for category in item_categories)
+    total_value = current_order.get("total", Decimal("0.00"))
+
+    if has_curry and not has_bread:
+        candidate_groups.append(bread_candidates)
+    if has_curry and not has_rice:
+        candidate_groups.append(rice_candidates)
+    if (has_biryani or total_value >= Decimal("18.00")) and not has_drink:
+        candidate_groups.append(drink_candidates)
+    if total_value >= Decimal("15.00") and not has_dessert:
+        candidate_groups.append(dessert_candidates)
+    if not has_starter and len(item_names) <= 2:
+        candidate_groups.append(starter_candidates)
+
+    ranked_suggestions: List[Dict[str, str]] = []
+    seen_items: set[str] = set()
+    for group in candidate_groups:
+        sorted_group = sorted(
+            group,
+            key=lambda candidate: (
+                candidate["item_name"] in recent_suggestions,
+                candidate["item_name"] not in favorite_items,
+                candidate["item_name"],
+            ),
+        )
+        for candidate in sorted_group:
+            item_name = candidate["item_name"]
+            if item_name in item_names or item_name in seen_items:
+                continue
+            ranked_suggestions.append(candidate)
+            seen_items.add(item_name)
+            break
+    return ranked_suggestions[:2]
 
 
 def add_menu_item_to_current_order(state: Dict[str, Any], item_name: str, qty: int = 1) -> bool:
@@ -1488,14 +1529,28 @@ def add_menu_item_to_current_order(state: Dict[str, Any], item_name: str, qty: i
     return True
 
 
+def remember_suggested_item(state: Dict[str, Any], item_name: str) -> None:
+    if not item_name:
+        return
+    history = [item for item in state.get("recent_suggestions", []) if item != item_name]
+    history.append(item_name)
+    state["recent_suggestions"] = history[-6:]
+    state["pending_suggested_item"] = item_name
+
+
 def maybe_accept_suggested_item(state: Dict[str, Any], message: str) -> Optional[str]:
     suggested_item = state.get("pending_suggested_item", "").strip()
     if not suggested_item or not state.get("order", {}).get("items"):
         return None
     lowered = normalize_text(message).lower()
+    resolved_item = find_menu_item(lowered)
     has_affirmation = bool(re.search(r"\b(yes+|ok|okay|sure|yeah|yep|please|go ahead)\b", lowered))
     has_add_signal = bool(re.search(r"\badd\b", lowered))
-    has_reference = bool(re.search(r"\b(it|that|this)\b", lowered)) or suggested_item.lower() in lowered
+    has_reference = (
+        bool(re.search(r"\b(it|that|this)\b", lowered))
+        or suggested_item.lower() in lowered
+        or (resolved_item is not None and resolved_item.get("name", "") == suggested_item)
+    )
     if not ((has_add_signal and has_reference) or (has_affirmation and has_reference) or suggested_item.lower() in lowered):
         return None
     if add_menu_item_to_current_order(state, suggested_item):
@@ -1505,7 +1560,7 @@ def maybe_accept_suggested_item(state: Dict[str, Any], message: str) -> Optional
 
 def extract_explicit_add_item(message: str) -> Optional[str]:
     lowered = normalize_text(message).lower()
-    match = re.match(r"^(?:please\s+)?add\s+(.+)$", lowered)
+    match = re.match(r"^(?:(?:yes+|ok|okay|sure|yeah|yep|please)\s+)*(?:please\s+)?add\s+(.+)$", lowered)
     if not match:
         return None
     candidate = match.group(1).strip()
@@ -1611,7 +1666,7 @@ def handle_context_intent(user_id: str, state: Dict[str, Any], message: str, con
     if intent == "suggest_items":
         suggestions = get_structured_suggestions(get_user_context(state), state.get("order", {}))
         if suggestions:
-            state["pending_suggested_item"] = suggestions[0]["item_name"]
+            remember_suggested_item(state, suggestions[0]["item_name"])
             return suggestions[0]["message"]
     if intent == "modify_existing_order" and state.get("order", {}).get("items"):
         updated, changed = modify_order_from_text(state["order"], message)
@@ -1698,7 +1753,7 @@ def generate_order_summary(order: Dict[str, Any], state: Optional[Dict[str, Any]
             lines.extend(["", f"Saved preferences: {', '.join(modifiers)}"])
         structured_suggestions = get_structured_suggestions(get_user_context(state), order)
         if structured_suggestions:
-            state["pending_suggested_item"] = structured_suggestions[0]["item_name"]
+            remember_suggested_item(state, structured_suggestions[0]["item_name"])
             lines.extend(["", structured_suggestions[0]["message"]])
     lines.extend(
         [

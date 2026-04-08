@@ -3,8 +3,10 @@ import difflib
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
+import string
 import threading
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -214,7 +216,7 @@ processed_message_ids = set()
 payment_followup_timers: Dict[str, threading.Timer] = {}
 payment_timer_lock = threading.Lock()
 google_sheets_client = None
-google_sheets_lock = threading.Lock()
+google_sheets_lock = threading.RLock()
 
 EVENT_SHEET_HEADERS = [
     "Timestamp",
@@ -619,10 +621,119 @@ def empty_order() -> Dict[str, Any]:
     }
 
 
-def generate_order_id(user_id: str, state: Dict[str, Any]) -> str:
+def generate_session_order_id(user_id: str, state: Dict[str, Any]) -> str:
     state["order_sequence"] = int(state.get("order_sequence", 0)) + 1
     suffix = "".join(ch for ch in user_id if ch.isdigit())[-4:] or "0000"
     return f"AGN-{suffix}-{state['order_sequence']:04d}"
+
+
+def generate_order_id() -> str:
+    date_part = datetime.now().strftime("%Y%m%d")
+    random_part = "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
+    return f"ORD-{date_part}-{random_part}"
+
+
+def is_unique_order_id(order_id: str, existing_ids: set[str]) -> bool:
+    return order_id not in existing_ids
+
+
+def get_unique_order_id(existing_ids: set[str]) -> str:
+    while True:
+        order_id = generate_order_id()
+        if is_unique_order_id(order_id, existing_ids):
+            return order_id
+
+
+def update_state_order_id(state: Dict[str, Any], new_order_id: str) -> None:
+    previous_order_id = state.get("active_order_id") or state.get("order", {}).get("order_id", "")
+    if previous_order_id == new_order_id:
+        return
+
+    orders = state.setdefault("orders", {})
+    existing_record = deepcopy(orders.get(previous_order_id, {}))
+
+    state["active_order_id"] = new_order_id
+    state["last_completed_order_id"] = new_order_id
+    state.setdefault("order", {})["order_id"] = new_order_id
+
+    if previous_order_id and previous_order_id in orders:
+        orders.pop(previous_order_id, None)
+
+    if existing_record:
+        existing_record["order_id"] = new_order_id
+        orders[new_order_id] = existing_record
+
+
+def build_order_sheet_row(user_id: str, state: Dict[str, Any], event_type: str, timestamp: Optional[str] = None) -> List[str]:
+    order = state.get("order", {})
+    profile = state.get("customer_profile", {})
+    items_summary = ", ".join(f"{item.get('name', '')} x{item.get('qty', 0)}" for item in order.get("items", []))
+    return [
+        timestamp or utc_now().isoformat(),
+        order.get("order_id", ""),
+        user_id,
+        profile.get("name", ""),
+        profile.get("mobile", ""),
+        profile.get("email", ""),
+        profile.get("service_type", ""),
+        profile.get("preferred_time", ""),
+        profile.get("guests", ""),
+        items_summary,
+        str(order.get("total", Decimal("0.00"))),
+        order.get("currency", DEFAULT_CURRENCY),
+        state.get("payment_status", ""),
+        state.get("payment_method", ""),
+        state.get("order_stage", ""),
+        state.get("stage", ""),
+        event_type,
+    ]
+
+
+def fetch_existing_order_ids(worksheet: gspread.Worksheet) -> set[str]:
+    order_ids = worksheet.col_values(2)
+    return {order_id.strip() for order_id in order_ids[1:] if order_id.strip()}
+
+
+def save_confirmed_order_to_google_sheets(user_id: str, state: Dict[str, Any], event_type: str = "order_confirmed") -> None:
+    worksheet = get_or_create_google_worksheet(GOOGLE_SHEETS_ORDER_SHEET)
+    if not worksheet:
+        raise RuntimeError("worksheet_unavailable")
+
+    previous_order_id = state.get("active_order_id") or state.get("order", {}).get("order_id", "")
+    timestamp = utc_now().isoformat()
+
+    with google_sheets_lock:
+        order_ids = worksheet.col_values(2)
+        existing_ids = {order_id.strip() for order_id in order_ids[1:] if order_id.strip()}
+        if previous_order_id:
+            existing_ids.discard(previous_order_id)
+
+        new_order_id = get_unique_order_id(existing_ids)
+        update_state_order_id(state, new_order_id)
+        sync_active_order_record(state)
+        row = build_order_sheet_row(user_id, state, event_type, timestamp)
+
+        target_row_index = None
+        for index, existing_order_id in enumerate(order_ids[1:], start=2):
+            if existing_order_id == previous_order_id or existing_order_id == new_order_id:
+                target_row_index = index
+                break
+
+        if target_row_index is None:
+            worksheet.append_row(row, value_input_option="USER_ENTERED", table_range="A1")
+        else:
+            worksheet.update(f"A{target_row_index}:Q{target_row_index}", [row], value_input_option="USER_ENTERED")
+
+
+def confirm_order_and_store(user_id: str, state: Dict[str, Any]) -> Optional[str]:
+    try:
+        save_confirmed_order_to_google_sheets(user_id, state)
+    except Exception as exc:
+        logger.warning("Confirmed order save failed: %s", exc)
+        return "⚠️ Order could not be saved. Please try again."
+
+    finalize_confirmation(state)
+    return None
 
 
 def sync_active_order_record(state: Dict[str, Any]) -> None:
@@ -649,7 +760,7 @@ def sync_active_order_record(state: Dict[str, Any]) -> None:
 
 def start_new_order(state: Dict[str, Any], user_id: str) -> str:
     sync_active_order_record(state)
-    new_order_id = generate_order_id(user_id, state)
+    new_order_id = generate_session_order_id(user_id, state)
     state["active_order_id"] = new_order_id
     state["order"] = empty_order()
     state["order"]["order_id"] = new_order_id
@@ -689,7 +800,7 @@ def get_order_record(state: Dict[str, Any], order_id: str) -> Optional[Dict[str,
 
 
 def extract_order_id(text: str) -> Optional[str]:
-    match = re.search(r"\bAGN-\d{4}-\d{4}\b", text.upper())
+    match = re.search(r"\b(?:AGN-\d{4}-\d{4}|ORD-\d{8}-[A-Z0-9]{5})\b", text.upper())
     return match.group(0) if match else None
 
 
@@ -710,7 +821,7 @@ def resolve_order_reference(state: Dict[str, Any], text: str) -> Optional[str]:
         return explicit
 
     upper_text = text.upper()
-    suffix_match = re.search(r"\b(\d{4})\b", upper_text)
+    suffix_match = re.search(r"\b([A-Z0-9]{4,5})\b", upper_text)
     if suffix_match:
         suffix = suffix_match.group(1)
         for order_id in sorted_order_ids(state):
@@ -853,6 +964,7 @@ def validate_order(parsed_items: List[Dict[str, Any]]) -> Dict[str, Any]:
         "corrected_items": corrected_items,
         "invalid_items": invalid_items,
         "fraud_detected": fraud_detected,
+        "submitted_total": sum((item["user_price"] for item in parsed_items), Decimal("0.00")),
     }
 
 
@@ -869,6 +981,7 @@ def build_validated_order_message(validated: Dict[str, Any], total: Decimal) -> 
     corrected_items = validated["corrected_items"]
     invalid_items = validated["invalid_items"]
     fraud_detected = validated["fraud_detected"]
+    submitted_total = validated.get("submitted_total", Decimal("0.00"))
     if not corrected_items:
         return "I couldn’t find any valid menu items in that order. Please use the menu link and send the item names again."
 
@@ -884,6 +997,9 @@ def build_validated_order_message(validated: Dict[str, Any], total: Decimal) -> 
 
     if invalid_items:
         lines.extend(["", "❌ Some items were not found in our menu and were removed.", f"Removed: {', '.join(invalid_items)}"])
+
+    if fraud_detected and submitted_total > Decimal("0.00"):
+        lines.extend(["", f"Original subtotal: {money_to_text(submitted_total, DEFAULT_CURRENCY)} → Corrected total: {money_to_text(total, DEFAULT_CURRENCY)}"])
 
     lines.extend(["", f"💰 Total: {money_to_text(total, DEFAULT_CURRENCY)}", "", "Reply CONFIRM to place your order."])
     return "\n".join(lines)
@@ -912,9 +1028,9 @@ def parse_order_message(text: str) -> Optional[Dict[str, Any]]:
         "guests": re.search(r"Guests\s*:\s*(.+)", normalized, flags=re.IGNORECASE),
     }
     total_match = re.search(
-        r"(?:Total|Subtotal)\s*:\s*[\u20ac\u20b9]?\s*([0-9]+(?:[.,][0-9]{1,2})?)",
+        r"(?mi)^\s*(?:Total|Subtotal)\s*:\s*[\u20ac\u20b9]?\s*([0-9]+(?:[.,][0-9]{1,2})?)\s*$",
         normalized,
-        flags=re.IGNORECASE,
+        flags=re.IGNORECASE | re.MULTILINE,
     )
     item_pattern = re.compile(
         r"^\s*[*\-\u2022]?\s*(?P<name>.+?)\s*x(?P<qty>\d+)(?:\s*\([^\d]*?(?P<each>[0-9]+(?:[.,][0-9]{1,2})?(?:/[0-9]+(?:[.,][0-9]{1,2})?)?)\s*each\))?\s*=\s*[^\d]?\s*(?P<price>[0-9]+(?:[.,][0-9]{1,2})?)\s*$",
@@ -924,6 +1040,7 @@ def parse_order_message(text: str) -> Optional[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     invalid_items: List[str] = []
     fraud_detected = False
+    submitted_items_total = Decimal("0.00")
     for line in normalized.splitlines():
         match = item_pattern.match(line.strip())
         if not match:
@@ -931,6 +1048,7 @@ def parse_order_message(text: str) -> Optional[Dict[str, Any]]:
         item_name = match.group("name").strip()
         quantity = int(match.group("qty"))
         user_line_price = parse_decimal(match.group("price"))
+        submitted_items_total += user_line_price
         menu_item = find_menu_item(item_name)
         if not menu_item:
             invalid_items.append(item_name)
@@ -952,7 +1070,7 @@ def parse_order_message(text: str) -> Optional[Dict[str, Any]]:
 
     currency = "EUR" if "\u20ac" in normalized else DEFAULT_CURRENCY
     derived_total = sum((item["price"] for item in items), Decimal("0.00"))
-    parsed_total = parse_decimal(total_match.group(1)) if total_match else derived_total
+    parsed_total = parse_decimal(total_match.group(1)) if total_match else submitted_items_total
     if parsed_total.quantize(Decimal("0.01")) != derived_total.quantize(Decimal("0.01")):
         fraud_detected = True
     name_value = fields["name"].group(1).strip() if fields["name"] else ""
@@ -964,6 +1082,7 @@ def parse_order_message(text: str) -> Optional[Dict[str, Any]]:
         "currency": currency,
         "fraud_detected": fraud_detected,
         "invalid_items": invalid_items,
+        "submitted_total": parsed_total,
         "profile": {
             "name": name_value,
             "mobile": fields["mobile"].group(1).strip() if fields["mobile"] else "",
@@ -1230,7 +1349,11 @@ def schedule_payment_followup(user_id: str, order_id: str) -> None:
             state["payment_pending_since"] = state.get("payment_pending_since") or utc_now() - timedelta(seconds=60)
             try:
                 if verify_online_payment(state):
-                    finalize_confirmation(state)
+                    error_message = confirm_order_and_store(user_id, state)
+                    if error_message:
+                        save_state(user_id, state)
+                        send_whatsapp_message(user_id, error_message)
+                        return
                     save_state(user_id, state)
                     send_whatsapp_message(user_id, payment_success_message(state), max_words=220)
                     return
@@ -1240,7 +1363,11 @@ def schedule_payment_followup(user_id: str, order_id: str) -> None:
 
             state["payment_method"] = "counter"
             state["payment_status"] = "done"
-            finalize_confirmation(state)
+            error_message = confirm_order_and_store(user_id, state)
+            if error_message:
+                save_state(user_id, state)
+                send_whatsapp_message(user_id, error_message)
+                return
             save_state(user_id, state)
             send_whatsapp_message(user_id, payment_counter_fallback_message(state), max_words=220)
         finally:
@@ -1402,27 +1529,7 @@ def upsert_order_sheet_row(user_id: str, state: Dict[str, Any], event_type: str)
     if not worksheet:
         return
 
-    profile = state.get("customer_profile", {})
-    items_summary = ", ".join(f"{item.get('name', '')} x{item.get('qty', 0)}" for item in order.get("items", []))
-    row = [
-        utc_now().isoformat(),
-        order_id,
-        user_id,
-        profile.get("name", ""),
-        profile.get("mobile", ""),
-        profile.get("email", ""),
-        profile.get("service_type", ""),
-        profile.get("preferred_time", ""),
-        profile.get("guests", ""),
-        items_summary,
-        str(order.get("total", Decimal("0.00"))),
-        order.get("currency", DEFAULT_CURRENCY),
-        state.get("payment_status", ""),
-        state.get("payment_method", ""),
-        state.get("order_stage", ""),
-        state.get("stage", ""),
-        event_type,
-    ]
+    row = build_order_sheet_row(user_id, state, event_type)
 
     with google_sheets_lock:
         order_ids = worksheet.col_values(2)
@@ -1845,7 +1952,9 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
             return "Please use the payment option shown above."
         try:
             if verify_online_payment(state):
-                finalize_confirmation(state)
+                error_message = confirm_order_and_store(user_id, state)
+                if error_message:
+                    return error_message
                 return payment_success_message(state)
         except requests.RequestException as exc:
             logger.warning("Payment verification failed: %s", exc)
@@ -1876,14 +1985,18 @@ def execute_action(user_id: str, state: Dict[str, Any], decision: Dict[str, Any]
 
         state["payment_method"] = "counter"
         state["payment_status"] = "done"
-        finalize_confirmation(state)
+        error_message = confirm_order_and_store(user_id, state)
+        if error_message:
+            return error_message
         cancel_payment_followup(user_id, state.get("active_order_id", ""))
         return payment_counter_fallback_message(state)
     if action == "pay_at_counter":
         state["payment_method"] = "counter"
         state["failure_count"] = 0
         cancel_payment_followup(user_id, state.get("active_order_id", ""))
-        finalize_confirmation(state)
+        error_message = confirm_order_and_store(user_id, state)
+        if error_message:
+            return error_message
         return (
             "Perfect. Payment is marked for counter. Your order is now being prepared \U0001f37d\ufe0f\n\n"
             "\u23f3 Estimated time: 15 minutes\n\n"
@@ -2150,6 +2263,7 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
                 ],
                 "invalid_items": parsed.get("invalid_items", []),
                 "fraud_detected": parsed.get("fraud_detected", False),
+                "submitted_total": parsed.get("submitted_total", Decimal("0.00")),
             }
             return build_validated_order_message(validated_payload, state["order"]["total"])
         return generate_order_summary(state["order"], state)

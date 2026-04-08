@@ -1,3 +1,5 @@
+import base64
+import difflib
 import json
 import logging
 import os
@@ -41,7 +43,9 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 SHEET_WEBHOOK_URL = os.getenv("SHEET_WEBHOOK_URL", "")
 GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+GOOGLE_SERVICE_ACCOUNT_JSON_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "")
 GOOGLE_SHEETS_EVENT_SHEET = os.getenv("GOOGLE_SHEETS_EVENT_SHEET", "Events")
+GOOGLE_SHEETS_ORDER_SHEET = os.getenv("GOOGLE_SHEETS_ORDER_SHEET", "Orders")
 GOOGLE_SHEETS_RESERVATION_SHEET = os.getenv("GOOGLE_SHEETS_RESERVATION_SHEET", "Reservations")
 HUMAN_HANDOFF_CONTACT = os.getenv("HUMAN_HANDOFF_CONTACT", "")
 
@@ -78,12 +82,198 @@ SUPPORTED_ACTIONS = {
     "handoff_to_human",
 }
 
+FIXED_MENU_PAGES = {
+    1: {
+        "tab": "Pantry & Pairings",
+        "label": "Pantry & Pairings",
+        "title": "Riso, Pane, Bevande & Dolci",
+        "categories": [
+            {"name": "Riso & Biryani", "items": [
+                {"name": "Steamed Basmati Rice", "description": "riso Basmati", "price": "4", "highlight": False},
+                {"name": "Jeera Rice", "description": "riso con cumino Profumato", "price": "5", "highlight": True},
+                {"name": "Veg Biryani", "description": "riso Basmati, verdure, spezie", "price": "7", "highlight": False},
+                {"name": "Chicken Biryani", "description": "riso Basmati, verdure, spezie Ricco. Aromatico", "price": "8", "highlight": False},
+                {"name": "Lamb Biryani", "description": "riso Basmati, agnello, spezie Profondo. Intenso", "price": "10", "highlight": False},
+                {"name": "Prawn Biryani", "description": "riso Basmati, gamberi, spezie Elegante. Premium", "price": "10", "highlight": False}
+            ]},
+            {"name": "Pane Indiano", "items": [
+                {"name": "Naan", "description": "farina, Acqua, lieveto", "price": "1.50", "highlight": False},
+                {"name": "Butter Naan", "description": "Farina, aglio, burro", "price": "2", "highlight": False},
+                {"name": "Garlic Naan", "description": "farina, pate, spezie", "price": "2.50", "highlight": False},
+                {"name": "Cheese Naan", "description": "farina, pate, spezie", "price": "3", "highlight": False},
+                {"name": "Aloo Kulcha", "description": "farina, pate, spezie Morbido. Semplice", "price": "2.50", "highlight": False},
+                {"name": "Amritsari Kulcha", "description": "farina, patate, cipolla, spezie Croccante. Ricco", "price": "3", "highlight": False}
+            ]},
+            {"name": "Bevande", "items": [
+                {"name": "Acqua Naturale", "price": "3", "highlight": False},
+                {"name": "Acqua Frizzante", "price": "3.50", "highlight": False},
+                {"name": "Coca-Cola Zero", "price": "3", "highlight": False},
+                {"name": "Coca-Cola", "price": "2.50", "highlight": False},
+                {"name": "Redbull", "price": "3", "highlight": False},
+                {"name": "Te Pesca/Limone", "price": "2.50", "highlight": False},
+                {"name": "Birra Moretti", "price": "3/5", "highlight": False},
+                {"name": "Corona", "price": "4", "highlight": False},
+                {"name": "Kingfisher", "price": "4/6", "highlight": False},
+                {"name": "Peroni", "price": "4/6", "highlight": False},
+                {"name": "Mango Lassi", "price": "3", "highlight": False},
+                {"name": "Sweet Lassi Classico", "price": "2.50", "highlight": False},
+                {"name": "Roohafza", "price": "2.50", "highlight": False},
+                {"name": "Lemon Soda", "price": "2", "highlight": False},
+                {"name": "Masala Tea", "price": "2.50", "highlight": False}
+            ]},
+            {"name": "Dolci", "items": [
+                {"name": "Tiramisu Classico", "description": "Mascarpone, caffe, cacao", "price": "5", "highlight": False},
+                {"name": "Gulab Jamun Caldo", "description": "Latte, sciroppo, zucchero", "price": "4", "highlight": False},
+                {"name": "Jalebi", "description": "farina, yogurt, zucchero, sciroppo, zafferano", "price": "3.50", "highlight": False},
+                {"name": "Gelato", "description": "cioccolato, mango, fragola", "price": "3", "highlight": False},
+                {"name": "Gelato Vegano", "description": "vaniglia, mandorla, cioccolato", "price": "3.50", "highlight": False}
+            ]}
+        ]
+    },
+    2: {
+        "tab": "Curries & Classics",
+        "label": "Curries & Classics",
+        "title": "Vegetariani, Pollo, Agnello & Pesce",
+        "categories": [
+            {"name": "Piatti Vegetariani", "items": [
+                {"name": "Paneer Butter Masala", "description": "formaggio fresco indiano, Burro, Pomodoro Cremoso. Avvolgente", "price": "10", "highlight": True},
+                {"name": "Shahi Paneer", "description": "formaggio fresco indiano, Pomodoro, Anacardi Ricco. Elegante", "price": "10", "highlight": False},
+                {"name": "Matar Paneer Classico", "description": "formaggio fresco indiano, Piselli, Pomodoro Semplice. Confortevole", "price": "9", "highlight": False},
+                {"name": "Kadhai Paneer", "description": "formaggio fresco indiano, Pepperoni, Spezie", "price": "10", "highlight": False},
+                {"name": "Palak Paneer Cremoso", "description": "formaggio fresco indiano, Spinaci, Panna", "price": "11", "highlight": False},
+                {"name": "Mushroom Masala", "description": "funghi, pomodoro, Cipolla, Spezie Morbido. Succoso. Cremoso", "price": "10", "highlight": True},
+                {"name": "Punjabi Rajma", "description": "fagioli Rossi, cipolla, spezie", "price": "9", "highlight": False},
+                {"name": "Malai Kofta Imperiale", "description": "polpette, panna, zafferano Morbido. Premium", "price": "12", "highlight": False},
+                {"name": "Mix Veg Affumicato", "description": "verdure miste, Spezie, Burro/Panna Ricco. Aromatico", "price": "9", "highlight": True},
+                {"name": "Amritsari Chana Masala", "description": "Ceci, Pomodoro, Spezie", "price": "8", "highlight": False},
+                {"name": "Baingan Bharta", "description": "melanzane, pomodoro, spezie", "price": "11", "highlight": False},
+                {"name": "Dal Makhani Aromatico", "description": "lenticchie nere, Burro, Panna", "price": "8", "highlight": False},
+                {"name": "Dal Punjabi", "description": "lenticchie gialle, Aglio, Cumino", "price": "9", "highlight": False}
+            ]},
+            {"name": "Piatti con Pollo", "items": [
+                {"name": "Butter Chicken", "description": "pollo, burro, pomodoro, panna Ricco. Cremoso. Iconico", "price": "10", "highlight": True},
+                {"name": "Tikka Masala Classico", "description": "pollo, pomodoro, panna Morbido. Bilanciato", "price": "11", "highlight": True},
+                {"name": "Chicken Kadhai", "description": "pollo, peperoni, spezie", "price": "10", "highlight": False},
+                {"name": "Chicken Curry Classico", "description": "pollo, pomodoro, spezie", "price": "9", "highlight": False},
+                {"name": "Chicken Korma Cremoso", "description": "pollo, anacardi, panna", "price": "10", "highlight": False},
+                {"name": "Chicken Madras", "description": "pollo, vindaloo, semi di senape, foglie di curry", "price": "12", "highlight": False}
+            ]},
+            {"name": "Piatti con Agnello", "items": [
+                {"name": "Lamb Madras", "description": "agnello, vindaloo, semi di senape, foglie di curry Profondo. Aromatico", "price": "12", "highlight": False},
+                {"name": "Lamb Curry Classico", "description": "agnello, spezie", "price": "11", "highlight": False}
+            ]},
+            {"name": "Piatti con Pesce", "items": [
+                {"name": "Fish Curry Classico", "description": "pesce, pomodoro, spezie", "price": "11", "highlight": False},
+                {"name": "Prawn Curry Imperiale", "description": "gamberi, Spezie, Panna Ricco. Premium", "price": "12", "highlight": True}
+            ]}
+        ]
+    },
+    3: {
+        "tab": "Street & Tandoor",
+        "label": "Street & Tandoor",
+        "title": "Antipasti, Street Food & Tandoor",
+        "categories": [
+            {"name": "Antipasti Non Vegetariani", "items": [
+                {"name": "Indo Chilli Chicken", "description": "pollo, peperoncino, salsa di Soia Desio. Piccante. Avvolgente", "price": "9", "highlight": True},
+                {"name": "Chicken Pakoda Dorato", "description": "pollo, farina di ceci, spezie", "price": "7", "highlight": False},
+                {"name": "Fish Pakoda Marino", "description": "pesce orata, zenzero, aglio", "price": "8", "highlight": False},
+                {"name": "Keema Samosa Imperiale", "description": "carne macinata, piselli, spezie", "price": "6", "highlight": False}
+            ]},
+            {"name": "Antipasti Vegetariani", "items": [
+                {"name": "Indo Chilli Paneer", "description": "paneer, peperoncino, salsa di Soia Agrodolce. Intenso", "price": "8", "highlight": True},
+                {"name": "Paneer Pakoda Croccante", "description": "formaggio fresco indiano, farina di ceci, peperoncino", "price": "9", "highlight": False},
+                {"name": "Mix Pakoda Croccante", "description": "verdure mix, pastella speziata", "price": "5", "highlight": False},
+                {"name": "Punjabi Samosa Classic", "description": "patate, piselli, tamarindo Croccante. Caldo. Tradizionale", "price": "4", "highlight": True},
+                {"name": "Honey Chilli Potato", "description": "patate, miele, peperoncino, sesamo", "price": "4", "highlight": False},
+                {"name": "Cheese Balls Croccanti", "description": "formaggio, panatura, dorata", "price": "4", "highlight": False},
+                {"name": "Agni Veg Platter", "description": "samosa, pakoda, tikki Perfetto da condividere", "price": "10", "highlight": True},
+                {"name": "Spring Roll Croccanti", "description": "verdure, sfoglia croccante", "price": "7", "highlight": False}
+            ]},
+            {"name": "Agni's Street Specials", "items": [
+                {"name": "Desi Chowmin", "description": "noodles, verdure/pollo, salsa", "price": "7", "highlight": False},
+                {"name": "Bombay Bhel Puri", "description": "riso soffiato, salsa dolce, salsa piccante, verdure", "price": "8", "highlight": False},
+                {"name": "Tikki Chaat Classico", "description": "patate, ceci, yogurt", "price": "5", "highlight": False},
+                {"name": "Golgappe", "description": "sfoglie croccanti, acqua speziata Fresco. Divertente. Iconico", "price": "5", "highlight": False}
+            ]},
+            {"name": "Specialita al Tandoor", "items": [
+                {"name": "Chicken Tikka Classico", "description": "pollo, yogurt, spezie Morbido. Aromatico e Ben marinato", "price": "10", "highlight": True},
+                {"name": "Tandoori Chicken", "description": "pollo, yogurt, spezie affumicate", "price": "13", "highlight": True},
+                {"name": "Malai Tikka Cremoso", "description": "pollo, panna, anacardi", "price": "11", "highlight": False},
+                {"name": "Green Haryali Tikka", "description": "pollo, menta, coriandolo", "price": "11", "highlight": False},
+                {"name": "Fish Tikka Marino", "description": "pesce orata, erbe, spezie Leggero. Grigliato", "price": "12", "highlight": False},
+                {"name": "King Prawns Imperiali", "description": "gamberi, zenzero, aglio Succoso. Premium", "price": "13", "highlight": True},
+                {"name": "Paneer Tikka Affumicato", "description": "formaggio fresco indiano, Pepperoni, cipolla", "price": "12", "highlight": False},
+                {"name": "Mixed Grill Imperiale", "description": "pollo, pesce, keema", "price": "15", "highlight": True}
+            ]}
+        ]
+    }
+}
+
 db_lock = threading.Lock()
 processed_message_ids = set()
 payment_followup_timers: Dict[str, threading.Timer] = {}
 payment_timer_lock = threading.Lock()
 google_sheets_client = None
 google_sheets_lock = threading.Lock()
+
+EVENT_SHEET_HEADERS = [
+    "Timestamp",
+    "User ID",
+    "Event Type",
+    "Order ID",
+    "Customer Name",
+    "Mobile",
+    "Email",
+    "Service Type",
+    "Preferred Time",
+    "Guests",
+    "Total",
+    "Currency",
+    "Payment Status",
+    "Payment Method",
+    "Order Stage",
+    "Conversation Stage",
+    "State JSON",
+]
+ORDER_SHEET_HEADERS = [
+    "Last Updated",
+    "Order ID",
+    "User ID",
+    "Customer Name",
+    "Mobile",
+    "Email",
+    "Service Type",
+    "Preferred Time",
+    "Guests",
+    "Items Summary",
+    "Total",
+    "Currency",
+    "Payment Status",
+    "Payment Method",
+    "Order Stage",
+    "Conversation Stage",
+    "Last Event Type",
+]
+RESERVATION_SHEET_HEADERS = [
+    "Timestamp",
+    "User ID",
+    "Reservation Type",
+    "Reservation Message",
+]
+SHEET_LAYOUTS: Dict[str, Dict[str, Any]] = {
+    GOOGLE_SHEETS_EVENT_SHEET: {
+        "headers": EVENT_SHEET_HEADERS,
+        "widths": [190, 120, 120, 130, 170, 120, 220, 130, 130, 110, 90, 90, 120, 120, 110, 150, 420],
+    },
+    GOOGLE_SHEETS_ORDER_SHEET: {
+        "headers": ORDER_SHEET_HEADERS,
+        "widths": [190, 130, 120, 170, 120, 220, 130, 130, 110, 320, 90, 90, 120, 120, 110, 150, 120],
+    },
+    GOOGLE_SHEETS_RESERVATION_SHEET: {
+        "headers": RESERVATION_SHEET_HEADERS,
+        "widths": [190, 120, 140, 420],
+    },
+}
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -126,16 +316,32 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def normalize_google_service_account_info(service_account_info: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(service_account_info)
+    private_key = normalized.get("private_key")
+    if isinstance(private_key, str):
+        normalized["private_key"] = private_key.replace("\\n", "\n").strip()
+    return normalized
+
+
 def load_google_service_account_info() -> Tuple[Optional[Dict[str, Any]], str]:
     if GOOGLE_SERVICE_ACCOUNT_JSON.strip():
         try:
-            return json.loads(GOOGLE_SERVICE_ACCOUNT_JSON), "GOOGLE_SERVICE_ACCOUNT_JSON"
+            return normalize_google_service_account_info(json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)), "GOOGLE_SERVICE_ACCOUNT_JSON"
         except json.JSONDecodeError as exc:
             logger.warning("Invalid GOOGLE_SERVICE_ACCOUNT_JSON: %s", exc)
 
+    if GOOGLE_SERVICE_ACCOUNT_JSON_B64.strip():
+        try:
+            decoded = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON_B64).decode("utf-8")
+            return normalize_google_service_account_info(json.loads(decoded)), "GOOGLE_SERVICE_ACCOUNT_JSON_B64"
+        except Exception as exc:
+            logger.warning("Invalid GOOGLE_SERVICE_ACCOUNT_JSON_B64: %s", exc)
+
     if GOOGLE_SERVICE_ACCOUNT_FILE.exists():
         try:
-            return json.loads(GOOGLE_SERVICE_ACCOUNT_FILE.read_text(encoding="utf-8")), str(GOOGLE_SERVICE_ACCOUNT_FILE)
+            data = json.loads(GOOGLE_SERVICE_ACCOUNT_FILE.read_text(encoding="utf-8"))
+            return normalize_google_service_account_info(data), str(GOOGLE_SERVICE_ACCOUNT_FILE)
         except Exception as exc:
             logger.warning("Google service account file read failed (%s): %s", GOOGLE_SERVICE_ACCOUNT_FILE, exc)
 
@@ -149,7 +355,7 @@ def initialize_google_sheets_client() -> Optional[gspread.Client]:
     service_account_info, source = load_google_service_account_info()
     if not service_account_info:
         logger.warning(
-            "Google Sheets disabled: no valid service account credentials found in GOOGLE_SERVICE_ACCOUNT_JSON or %s.",
+            "Google Sheets disabled: no valid service account credentials found in GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_SERVICE_ACCOUNT_JSON_B64, or %s.",
             GOOGLE_SERVICE_ACCOUNT_FILE,
         )
         return None
@@ -166,6 +372,81 @@ def initialize_google_sheets_client() -> Optional[gspread.Client]:
     except Exception as exc:
         logger.warning("Google Sheets client initialization failed: %s", exc)
         return None
+
+
+def ensure_google_worksheet_layout(worksheet: gspread.Worksheet, headers: List[str], widths: List[int]) -> None:
+    current_headers = worksheet.row_values(1)
+    if current_headers[: len(headers)] != headers:
+        worksheet.update(f"A1:{gspread.utils.rowcol_to_a1(1, len(headers)).rstrip('1')}1", [headers], value_input_option="USER_ENTERED")
+
+    requests_payload = [
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": worksheet.id,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": len(headers),
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 0.09, "green": 0.34, "blue": 0.22},
+                        "horizontalAlignment": "CENTER",
+                        "textFormat": {
+                            "bold": True,
+                            "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                        },
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+            }
+        },
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": worksheet.id,
+                    "gridProperties": {"frozenRowCount": 1},
+                },
+                "fields": "gridProperties.frozenRowCount",
+            }
+        },
+        {
+            "setBasicFilter": {
+                "filter": {
+                    "range": {
+                        "sheetId": worksheet.id,
+                        "startRowIndex": 0,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": len(headers),
+                    }
+                }
+            }
+        },
+    ]
+    for index, width in enumerate(widths):
+        requests_payload.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": worksheet.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": index,
+                        "endIndex": index + 1,
+                    },
+                    "properties": {"pixelSize": width},
+                    "fields": "pixelSize",
+                }
+            }
+        )
+    worksheet.spreadsheet.batch_update({"requests": requests_payload})
+
+
+def ensure_google_sheet_structure(sheet_name: str, worksheet: gspread.Worksheet) -> None:
+    layout = SHEET_LAYOUTS.get(sheet_name)
+    if not layout:
+        return
+    ensure_google_worksheet_layout(worksheet, layout["headers"], layout["widths"])
 
 
 def get_google_sheets_client() -> Optional[gspread.Client]:
@@ -197,12 +478,10 @@ def log_google_sheets_status() -> None:
             spreadsheet.title,
             worksheet_titles,
         )
+        for sheet_name in (GOOGLE_SHEETS_EVENT_SHEET, GOOGLE_SHEETS_ORDER_SHEET, GOOGLE_SHEETS_RESERVATION_SHEET):
+            get_or_create_google_worksheet(sheet_name)
     except Exception as exc:
         logger.warning("Google Sheets startup check failed: %s", exc)
-
-
-log_google_sheets_status()
-
 
 def create_default_state() -> Dict[str, Any]:
     return {
@@ -467,6 +746,147 @@ def parse_decimal(raw_value: str) -> Decimal:
         return Decimal(cleaned)
     except InvalidOperation:
         return Decimal("0.00")
+
+
+def normalize_menu_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def normalize_price(price_string: str) -> Decimal:
+    cleaned = str(price_string or "").strip().replace("\u20ac", "").replace("\u20b9", "").replace(",", "")
+    if not cleaned:
+        return Decimal("0.00")
+    if "/" in cleaned:
+        options = [parse_decimal(part) for part in cleaned.split("/") if part.strip()]
+        return max(options) if options else Decimal("0.00")
+    return parse_decimal(cleaned)
+
+
+def parse_order(text: str) -> List[Dict[str, Any]]:
+    parsed_map: Dict[str, Dict[str, Any]] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.lower().startswith("order:") or line.lower().startswith("total:"):
+            continue
+
+        match = re.match(r"^(?:(?P<qty>\d+)\s*x\s*)?(?P<body>.+)$", line, flags=re.IGNORECASE)
+        if not match:
+            continue
+
+        quantity = int(match.group("qty") or 1)
+        body = re.sub(r"^[*\-\u2022]\s*", "", match.group("body") or "").strip()
+        price_match = re.search(r"[-:=]\s*([\u20ac\u20b9\?]?\s*\d+(?:[.,]\d{1,2})?(?:/\d+(?:[.,]\d{1,2})?)?)\s*$", body)
+        user_price = normalize_price(price_match.group(1)) if price_match else Decimal("0.00")
+        item_name = body[: price_match.start()].strip() if price_match else body
+        if not item_name:
+            continue
+        key = normalize_menu_text(item_name)
+        if key in parsed_map:
+            parsed_map[key]["quantity"] += quantity
+            parsed_map[key]["user_price"] += user_price
+            continue
+        parsed_map[key] = {
+            "item_name": item_name,
+            "quantity": quantity,
+            "user_price": user_price,
+        }
+    return list(parsed_map.values())
+
+
+def find_menu_item(name: str) -> Optional[Dict[str, Any]]:
+    normalized_name = normalize_menu_text(name)
+    if not normalized_name:
+        return None
+
+    all_items: List[Tuple[str, Dict[str, Any]]] = []
+    for page in FIXED_MENU_PAGES.values():
+        for category in page["categories"]:
+            for item in category["items"]:
+                all_items.append((normalize_menu_text(item["name"]), item))
+
+    for candidate_name, item in all_items:
+        if candidate_name == normalized_name:
+            return item
+
+    close_matches = difflib.get_close_matches(normalized_name, [candidate for candidate, _ in all_items], n=1, cutoff=0.8)
+    if not close_matches:
+        return None
+    winner = close_matches[0]
+    for candidate_name, item in all_items:
+        if candidate_name == winner:
+            return item
+    return None
+
+
+def calculate_total(valid_items: List[Dict[str, Any]]) -> Decimal:
+    return sum((item["real_price"] * item["quantity"] for item in valid_items), Decimal("0.00"))
+
+
+def validate_order(parsed_items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    corrected_items: List[Dict[str, Any]] = []
+    invalid_items: List[str] = []
+    fraud_detected = False
+
+    for parsed_item in parsed_items:
+        menu_item = find_menu_item(parsed_item["item_name"])
+        if not menu_item:
+            invalid_items.append(parsed_item["item_name"])
+            continue
+
+        real_price = normalize_price(menu_item["price"])
+        expected_total = (real_price * parsed_item["quantity"]).quantize(Decimal("0.01"))
+        user_price = parsed_item["user_price"].quantize(Decimal("0.01"))
+        if user_price > Decimal("0.00") and user_price != expected_total:
+            fraud_detected = True
+
+        corrected_items.append(
+            {
+                "item_name": menu_item["name"],
+                "quantity": parsed_item["quantity"],
+                "user_price": user_price,
+                "real_price": real_price,
+                "line_total": expected_total,
+            }
+        )
+
+    return {
+        "corrected_items": corrected_items,
+        "invalid_items": invalid_items,
+        "fraud_detected": fraud_detected,
+    }
+
+
+def detect_validatable_order_message(text: str) -> bool:
+    lowered = text.lower()
+    if "name:" in lowered and "items" in lowered:
+        return False
+    return bool(re.search(r"(?:^|\n)\s*(?:order\s*:)?", lowered)) and bool(
+        re.search(r"(?:^|\n)\s*(?:[*\-\u2022]\s*)?(?:\d+\s*x\s*)?.+?(?:\s*[-:=]\s*[\u20ac\u20b9]?\s*\d)", text, flags=re.IGNORECASE)
+    )
+
+
+def build_validated_order_message(validated: Dict[str, Any], total: Decimal) -> str:
+    corrected_items = validated["corrected_items"]
+    invalid_items = validated["invalid_items"]
+    fraud_detected = validated["fraud_detected"]
+    if not corrected_items:
+        return "I couldn’t find any valid menu items in that order. Please use the menu link and send the item names again."
+
+    header = "⚠️ Price Correction Applied" if fraud_detected else "✅ Order Verified"
+    lines = [header]
+    if fraud_detected:
+        lines.extend(["", "Some item prices were incorrect and have been updated.", "", "🧾 Corrected Order:"])
+    else:
+        lines.extend(["", "🧾 Items:"])
+
+    for item in corrected_items:
+        lines.append(f"* {item['item_name']} x{item['quantity']} → {money_to_text(item['line_total'], DEFAULT_CURRENCY)}")
+
+    if invalid_items:
+        lines.extend(["", "❌ Some items were not found in our menu and were removed.", f"Removed: {', '.join(invalid_items)}"])
+
+    lines.extend(["", f"💰 Total: {money_to_text(total, DEFAULT_CURRENCY)}", "", "Reply CONFIRM to place your order."])
+    return "\n".join(lines)
 
 
 def detect_order_message(text: str) -> bool:
@@ -869,6 +1289,7 @@ def append_sheet_log(user_id: str, state: Dict[str, Any], event_type: str) -> No
             json.dumps(serialize_state(state)),
         ],
     )
+    upsert_order_sheet_row(user_id, state, event_type)
     if not SHEET_WEBHOOK_URL:
         return
     payload = {
@@ -954,6 +1375,51 @@ def save_reservation_record(user_id: str, details: Dict[str, Any]) -> None:
     )
 
 
+def upsert_order_sheet_row(user_id: str, state: Dict[str, Any], event_type: str) -> None:
+    order = state.get("order", {})
+    order_id = order.get("order_id", "")
+    if not order_id:
+        return
+
+    worksheet = get_or_create_google_worksheet(GOOGLE_SHEETS_ORDER_SHEET)
+    if not worksheet:
+        return
+
+    profile = state.get("customer_profile", {})
+    items_summary = ", ".join(f"{item.get('name', '')} x{item.get('qty', 0)}" for item in order.get("items", []))
+    row = [
+        utc_now().isoformat(),
+        order_id,
+        user_id,
+        profile.get("name", ""),
+        profile.get("mobile", ""),
+        profile.get("email", ""),
+        profile.get("service_type", ""),
+        profile.get("preferred_time", ""),
+        profile.get("guests", ""),
+        items_summary,
+        str(order.get("total", Decimal("0.00"))),
+        order.get("currency", DEFAULT_CURRENCY),
+        state.get("payment_status", ""),
+        state.get("payment_method", ""),
+        state.get("order_stage", ""),
+        state.get("stage", ""),
+        event_type,
+    ]
+
+    with google_sheets_lock:
+        order_ids = worksheet.col_values(2)
+        target_row_index = None
+        for index, existing_order_id in enumerate(order_ids[1:], start=2):
+            if existing_order_id == order_id:
+                target_row_index = index
+                break
+        if target_row_index is None:
+            worksheet.append_row(row, value_input_option="USER_ENTERED", table_range="A1")
+        else:
+            worksheet.update(f"A{target_row_index}:Q{target_row_index}", [row], value_input_option="USER_ENTERED")
+
+
 def get_or_create_google_worksheet(sheet_name: str) -> Optional[gspread.Worksheet]:
     if not GOOGLE_SHEETS_SPREADSHEET_ID:
         logger.warning("Google Sheets append skipped: GOOGLE_SHEETS_SPREADSHEET_ID is not configured.")
@@ -965,9 +1431,11 @@ def get_or_create_google_worksheet(sheet_name: str) -> Optional[gspread.Workshee
     try:
         spreadsheet = client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
         try:
-            return spreadsheet.worksheet(sheet_name)
+            worksheet = spreadsheet.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
-            return spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=30)
+            worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=30)
+        ensure_google_sheet_structure(sheet_name, worksheet)
+        return worksheet
     except Exception as exc:
         logger.warning("Google Sheets worksheet access failed: %s", exc)
         return None
@@ -979,10 +1447,13 @@ def append_google_sheet_row(sheet_name: str, row: List[str]) -> None:
         return
     try:
         with google_sheets_lock:
-            worksheet.append_row(row, value_input_option="USER_ENTERED")
+            worksheet.append_row(row, value_input_option="USER_ENTERED", table_range="A1")
         logger.info("Google Sheets append succeeded: sheet=%s, first_cell=%s", sheet_name, row[0] if row else "")
     except Exception as exc:
         logger.warning("Google Sheets append failed: %s", exc)
+
+
+log_google_sheets_status()
 
 
 def should_ignore_duplicate(message_id: str) -> bool:
@@ -1136,6 +1607,8 @@ def infer_intent_rule(text: str, state: Dict[str, Any]) -> str:
     lowered = text.lower().strip()
     if resolve_order_reference(state, text):
         return "track_specific_order"
+    if detect_validatable_order_message(text):
+        return "order_validation"
     if detect_order_message(text):
         return "order_checkout"
     if lowered in {"1", "order", "order food", "new order", "order again", "another order"} and state["stage"] in {
@@ -1464,6 +1937,41 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
         return execute_action(user_id, state, {"action": "book_table"}, text)
     if intent == "reservation_check":
         return execute_action(user_id, state, {"action": "check_reservation"}, text)
+    if intent == "order_validation":
+        parsed_items = parse_order(text)
+        validated = validate_order(parsed_items)
+        corrected_items = validated["corrected_items"]
+        if not corrected_items:
+            state["failure_count"] += 1
+            return build_validated_order_message(validated, Decimal("0.00"))
+
+        if not state.get("active_order_id") or state.get("payment_status") == "done" or state.get("order_stage") in {"preparing", "served"}:
+            start_new_order(state, user_id)
+
+        state["intent"] = "order"
+        state["waiting_for_order"] = False
+        state["checkout_mode"] = "append"
+        state["order"] = {
+            "order_id": state.get("active_order_id", state.get("order", {}).get("order_id", "")),
+            "name": state.get("customer_profile", {}).get("name", state.get("order", {}).get("name", "")),
+            "items": [
+                {"name": item["item_name"], "qty": item["quantity"], "price": item["line_total"]}
+                for item in corrected_items
+            ],
+            "total": calculate_total(corrected_items),
+            "currency": DEFAULT_CURRENCY,
+        }
+        state["order_confirmed"] = False
+        state["payment_status"] = "pending"
+        state["payment_method"] = ""
+        state["payment_link"] = ""
+        state["payment_link_id"] = ""
+        state["payment_verification_attempts"] = 0
+        set_stage(state, STAGE_ORDER_ACTION)
+        state["failure_count"] = 0
+        sync_active_order_record(state)
+        append_sheet_log(user_id, state, "order_validated")
+        return build_validated_order_message(validated, state["order"]["total"])
     if intent == "order_status":
         order_ids = sorted_order_ids(state)
         if len(order_ids) > 1 and not resolve_order_reference(state, text):
@@ -1697,6 +2205,45 @@ def debug_sheets() -> Tuple[Any, int]:
         result["status"] = "access_failed"
         result["error"] = str(exc)
         return jsonify(result), 200
+
+
+@app.post("/debug/sheets/append")
+def debug_sheets_append() -> Tuple[Any, int]:
+    token = request.args.get("token", "")
+    if not VERIFY_TOKEN or token != VERIFY_TOKEN:
+        return jsonify({"status": "forbidden"}), 403
+
+    client = get_google_sheets_client()
+    if not GOOGLE_SHEETS_SPREADSHEET_ID:
+        return jsonify({"status": "spreadsheet_id_missing"}), 200
+    if not client:
+        return jsonify({"status": "client_unavailable"}), 200
+
+    test_row = [
+        utc_now().isoformat(),
+        "render-debug",
+        "debug_append_test",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "0.00",
+        DEFAULT_CURRENCY,
+        "",
+        "",
+        "",
+        "",
+        json.dumps({"source": "debug_sheets_append"}),
+    ]
+
+    try:
+        append_google_sheet_row(GOOGLE_SHEETS_EVENT_SHEET, test_row)
+        return jsonify({"status": "ok", "sheet": GOOGLE_SHEETS_EVENT_SHEET, "first_cell": test_row[0]}), 200
+    except Exception as exc:
+        return jsonify({"status": "append_failed", "error": str(exc)}), 200
 
 
 @app.get("/webhook")

@@ -1372,10 +1372,53 @@ def normalize_text(text: str) -> str:
     return (text or "").strip()
 
 
+def extract_language_switch(message: str) -> Optional[str]:
+    lowered = normalize_text(message).lower()
+    language_patterns = {
+        "en": {
+            "english",
+            "in english",
+            "english please",
+            "reply in english",
+            "speak english",
+        },
+        "it": {
+            "italian",
+            "in italian",
+            "italiano",
+            "parla italiano",
+            "rispondi in italiano",
+        },
+        "hi": {
+            "hindi",
+            "in hindi",
+            "hindi mein",
+            "hindi me",
+            "हिंदी",
+            "हिंदी में",
+        },
+        "hinglish": {
+            "hinglish",
+            "in hinglish",
+            "hinglish me",
+            "hinglish mein",
+            "roman hindi",
+        },
+    }
+    for language, phrases in language_patterns.items():
+        if lowered in phrases:
+            return language
+    return None
+
+
 def detect_user_language(text: str, state: Optional[Dict[str, Any]] = None) -> str:
     sample = normalize_text(text)
     if not sample:
         return str((state or {}).get("preferred_language", "en") or "en")
+
+    explicit_language = extract_language_switch(sample)
+    if explicit_language:
+        return explicit_language
 
     lowered = sample.lower()
     if re.search(r"[\u0900-\u097F]", sample):
@@ -1437,6 +1480,15 @@ def localize_reply_text(reply: str, state: Dict[str, Any]) -> str:
     except Exception as exc:
         logger.warning("Reply localization failed: %s", exc)
         return reply
+
+
+def language_switch_confirmation(language: str) -> str:
+    return {
+        "en": "Sure. I'll continue in English.",
+        "it": "Certo. Continuerò in italiano.",
+        "hi": "ज़रूर। मैं आगे हिंदी में जवाब दूंगा।",
+        "hinglish": "Bilkul. Main ab Hinglish mein reply karunga.",
+    }.get(language, "Sure. I'll continue in English.")
 
 
 def money_to_text(value: Decimal, currency: str) -> str:
@@ -2088,6 +2140,35 @@ def extract_preference_note(message: str) -> str:
     return ""
 
 
+def sanitize_preference_note(note: str) -> str:
+    lowered = normalize_text(note).lower()
+    allowed_preferences = {
+        "no spicy",
+        "less spicy",
+        "extra spicy",
+        "less oil",
+        "no onion",
+        "no garlic",
+        "no sugar",
+        "less salt",
+    }
+    return lowered if lowered in allowed_preferences else ""
+
+
+def sanitize_stored_preferences(state: Dict[str, Any]) -> List[str]:
+    preferences = state.setdefault("customer_profile", {}).setdefault("preferences", {})
+    modifiers = preferences.setdefault("modifiers", [])
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for note in modifiers:
+        normalized = sanitize_preference_note(str(note))
+        if normalized and normalized not in seen:
+            cleaned.append(normalized)
+            seen.add(normalized)
+    preferences["modifiers"] = cleaned
+    return cleaned
+
+
 def attach_preference_to_order(state: Dict[str, Any], note: str) -> bool:
     if not note or not state.get("order", {}).get("items"):
         return False
@@ -2102,6 +2183,7 @@ def attach_preference_to_order(state: Dict[str, Any], note: str) -> bool:
 
 
 def store_user_preference(state: Dict[str, Any], note: str) -> None:
+    note = sanitize_preference_note(note)
     if not note:
         return
     preferences = state.setdefault("customer_profile", {}).setdefault("preferences", {})
@@ -2111,9 +2193,57 @@ def store_user_preference(state: Dict[str, Any], note: str) -> None:
 
 
 def apply_saved_preferences_to_order(state: Dict[str, Any]) -> None:
-    modifiers = state.get("customer_profile", {}).get("preferences", {}).get("modifiers", [])
+    modifiers = sanitize_stored_preferences(state)
     for note in modifiers:
         attach_preference_to_order(state, note)
+
+
+def extract_remove_item_request(message: str) -> Optional[str]:
+    lowered = normalize_text(message).lower()
+    if not lowered:
+        return None
+
+    removal_signals = {
+        "remove",
+        "delete",
+        "cancel",
+        "without",
+        "dont add",
+        "don't add",
+        "dont want",
+        "don't want",
+        "do not add",
+        "do not want",
+        "not add",
+        "nahi chahiye",
+        "mat add",
+        "mat add karo",
+        "mat add karna",
+        "nahi hona chahiye",
+        "not in my order",
+        "not in the order",
+        "should not be in order",
+        "should not be in my order",
+        "shouldn't be in order",
+        "shouldn't be in my order",
+    }
+    if not any(signal in lowered for signal in removal_signals):
+        return None
+
+    matched_item: Optional[str] = None
+    matched_length = -1
+    for page in FIXED_MENU_PAGES.values():
+        for category in page["categories"]:
+            for item in category["items"]:
+                item_name = item["name"]
+                normalized_name = normalize_menu_text(item_name)
+                if not normalized_name:
+                    continue
+                if normalized_name in normalize_menu_text(lowered):
+                    if len(normalized_name) > matched_length:
+                        matched_item = item_name
+                        matched_length = len(normalized_name)
+    return matched_item
 
 
 def format_order_items_with_notes(items: List[Dict[str, Any]]) -> List[str]:
@@ -2374,7 +2504,11 @@ def maybe_accept_suggested_item(state: Dict[str, Any], message: str) -> Optional
         or explicit_add_item == suggested_item
     )
     ai_accepts = ai_match_suggested_item_reply(message, suggested_item)
-    if not ((has_add_signal and has_reference) or (has_affirmation and has_reference) or suggested_item.lower() in lowered or ai_accepts):
+    if not (
+        (has_add_signal and has_reference)
+        or (has_affirmation and has_reference)
+        or (ai_accepts and has_reference)
+    ):
         return None
     if add_menu_item_to_current_order(state, suggested_item):
         return build_contextual_update_message(state, suggested_item) + "\n\n" + generate_order_summary(state["order"], state)
@@ -2413,6 +2547,9 @@ def build_contextual_update_message(state: Dict[str, Any], item_name: str) -> st
 
 def detect_intent_with_context(message: str, state: Dict[str, Any]) -> Dict[str, Any]:
     lowered = normalize_text(message).lower()
+    remove_item = extract_remove_item_request(message)
+    if remove_item:
+        return {"intent": "remove_item_from_order", "item_name": remove_item}
     preference_note = extract_preference_note(message)
     if preference_note:
         return {"intent": "remove_preference", "preference_note": preference_note}
@@ -2439,7 +2576,7 @@ def detect_intent_with_context(message: str, state: Dict[str, Any]) -> Dict[str,
     system_prompt = (
         "Classify the user's message for a restaurant ordering assistant. "
         "Return only JSON with schema "
-        '{"intent":"reorder_last|remove_preference|suggest_items|modify_existing_order|general_order|greeting|unknown","preference_note":"string"}'
+        '{"intent":"reorder_last|remove_preference|remove_item_from_order|suggest_items|modify_existing_order|general_order|greeting|unknown","preference_note":"string","item_name":"string"}'
         ". AI must not change prices, bypass validation, or invent menu items."
     )
     try:
@@ -2458,6 +2595,7 @@ def detect_intent_with_context(message: str, state: Dict[str, Any]) -> Dict[str,
         if parsed.get("intent") not in {
             "reorder_last",
             "remove_preference",
+            "remove_item_from_order",
             "suggest_items",
             "modify_existing_order",
             "general_order",
@@ -2485,10 +2623,20 @@ def handle_context_intent(user_id: str, state: Dict[str, Any], message: str, con
         return greeting_message_for_state(state)
     if intent == "reorder_last":
         return format_reorder_message(state) or "I don't have a completed order to repeat yet."
+    if intent == "remove_item_from_order" and state.get("order", {}).get("items"):
+        item_name = context_intent.get("item_name") or extract_remove_item_request(message)
+        if item_name:
+            updated, changed = modify_order_from_text(state["order"], f"remove {item_name.lower()}")
+            if changed:
+                state["order"] = updated
+                set_stage(state, STAGE_ORDER_ACTION)
+                sync_active_order_record(state)
+                return f"Done. I removed {item_name} from your order.\n\n" + generate_order_summary(state["order"], state)
+            return f"I couldn't find {item_name} in your current order."
     if intent == "remove_preference":
-        note = context_intent.get("preference_note") or extract_preference_note(message)
+        note = sanitize_preference_note(context_intent.get("preference_note") or extract_preference_note(message))
         if not note:
-            return None
+            return "I won't save that as a food preference. If you want something removed, tell me the item name."
         store_user_preference(state, note)
         if attach_preference_to_order(state, note):
             sync_active_order_record(state)
@@ -2577,7 +2725,7 @@ def generate_order_summary(order: Dict[str, Any], state: Optional[Dict[str, Any]
         ]
     )
     if state is not None:
-        modifiers = state.get("customer_profile", {}).get("preferences", {}).get("modifiers", [])
+        modifiers = sanitize_stored_preferences(state)
         if modifiers:
             lines.extend(["", f"Saved preferences: {', '.join(modifiers)}"])
         structured_suggestions = get_structured_suggestions(get_user_context(state), order)
@@ -3806,10 +3954,25 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
 def build_reply(user_id: str, text: str) -> str:
     state = get_state(user_id)
     state["last_message_at"] = utc_now()
-    state["preferred_language"] = detect_user_language(text, state)
+    explicit_language = extract_language_switch(text)
+    if explicit_language:
+        state["preferred_language"] = explicit_language
+    else:
+        state["preferred_language"] = detect_user_language(text, state)
     refresh_order_stage(state)
     if state.get("sync_pending"):
         schedule_pending_sheet_sync(user_id)
+
+    if explicit_language:
+        acknowledgements = {
+            "en": "Sure, I'll continue in English.",
+            "it": "Certo, continuero in italiano.",
+            "hi": "ठीक है, मैं अब हिंदी में जवाब दूंगा।",
+            "hinglish": "Theek hai, ab main Hinglish mein reply karunga.",
+        }
+        reply = acknowledgements.get(explicit_language, "Sure, I'll continue in English.")
+        save_state(user_id, state)
+        return reply
 
     order_token = extract_order_token(text)
     if order_token:

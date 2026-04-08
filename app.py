@@ -1493,8 +1493,10 @@ def maybe_accept_suggested_item(state: Dict[str, Any], message: str) -> Optional
     if not suggested_item or not state.get("order", {}).get("items"):
         return None
     lowered = normalize_text(message).lower()
-    accepts = {"yes", "ok", "okay", "sure", "add it", "add that", "yes add it", "go ahead", "add"}
-    if lowered not in accepts and suggested_item.lower() not in lowered:
+    has_affirmation = bool(re.search(r"\b(yes+|ok|okay|sure|yeah|yep|please|go ahead)\b", lowered))
+    has_add_signal = bool(re.search(r"\badd\b", lowered))
+    has_reference = bool(re.search(r"\b(it|that|this)\b", lowered)) or suggested_item.lower() in lowered
+    if not ((has_add_signal and has_reference) or (has_affirmation and has_reference) or suggested_item.lower() in lowered):
         return None
     if add_menu_item_to_current_order(state, suggested_item):
         return build_contextual_update_message(state, suggested_item) + "\n\n" + generate_order_summary(state["order"], state)

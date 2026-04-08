@@ -27,6 +27,7 @@ DEFAULT_CURRENCY = os.getenv("CURRENCY_SYMBOL", "EUR")
 WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v20.0")
 ORDER_PREP_MINUTES = int(os.getenv("ORDER_PREP_MINUTES", "15"))
 DB_PATH = Path(os.getenv("STATE_DB_PATH", "agnikara_state.db"))
+GOOGLE_SERVICE_ACCOUNT_FILE = Path(os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "creditional.json"))
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
@@ -125,11 +126,34 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def load_google_service_account_info() -> Tuple[Optional[Dict[str, Any]], str]:
+    if GOOGLE_SERVICE_ACCOUNT_JSON.strip():
+        try:
+            return json.loads(GOOGLE_SERVICE_ACCOUNT_JSON), "GOOGLE_SERVICE_ACCOUNT_JSON"
+        except json.JSONDecodeError as exc:
+            logger.warning("Invalid GOOGLE_SERVICE_ACCOUNT_JSON: %s", exc)
+
+    if GOOGLE_SERVICE_ACCOUNT_FILE.exists():
+        try:
+            return json.loads(GOOGLE_SERVICE_ACCOUNT_FILE.read_text(encoding="utf-8")), str(GOOGLE_SERVICE_ACCOUNT_FILE)
+        except Exception as exc:
+            logger.warning("Google service account file read failed (%s): %s", GOOGLE_SERVICE_ACCOUNT_FILE, exc)
+
+    return None, ""
+
+
 def initialize_google_sheets_client() -> Optional[gspread.Client]:
-    if not GOOGLE_SHEETS_SPREADSHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
+    if not GOOGLE_SHEETS_SPREADSHEET_ID:
+        logger.warning("Google Sheets disabled: GOOGLE_SHEETS_SPREADSHEET_ID is not configured.")
+        return None
+    service_account_info, source = load_google_service_account_info()
+    if not service_account_info:
+        logger.warning(
+            "Google Sheets disabled: no valid service account credentials found in GOOGLE_SERVICE_ACCOUNT_JSON or %s.",
+            GOOGLE_SERVICE_ACCOUNT_FILE,
+        )
         return None
     try:
-        service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
         credentials = Credentials.from_service_account_info(
             service_account_info,
             scopes=[
@@ -137,6 +161,7 @@ def initialize_google_sheets_client() -> Optional[gspread.Client]:
                 "https://www.googleapis.com/auth/drive",
             ],
         )
+        logger.info("Google Sheets client initialized using %s.", source)
         return gspread.authorize(credentials)
     except Exception as exc:
         logger.warning("Google Sheets client initialization failed: %s", exc)
@@ -897,7 +922,11 @@ def save_reservation_record(user_id: str, details: Dict[str, Any]) -> None:
 
 
 def get_or_create_google_worksheet(sheet_name: str) -> Optional[gspread.Worksheet]:
-    if not google_sheets_client or not GOOGLE_SHEETS_SPREADSHEET_ID:
+    if not GOOGLE_SHEETS_SPREADSHEET_ID:
+        logger.warning("Google Sheets append skipped: GOOGLE_SHEETS_SPREADSHEET_ID is not configured.")
+        return None
+    if not google_sheets_client:
+        logger.warning("Google Sheets append skipped: client is unavailable. Check service-account credentials.")
         return None
     try:
         spreadsheet = google_sheets_client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)

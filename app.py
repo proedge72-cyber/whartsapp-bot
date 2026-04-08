@@ -171,6 +171,27 @@ def initialize_google_sheets_client() -> Optional[gspread.Client]:
 google_sheets_client = initialize_google_sheets_client()
 
 
+def log_google_sheets_status() -> None:
+    if not GOOGLE_SHEETS_SPREADSHEET_ID:
+        return
+    if not google_sheets_client:
+        logger.warning("Google Sheets startup check skipped: client is unavailable.")
+        return
+    try:
+        spreadsheet = google_sheets_client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
+        worksheet_titles = [worksheet.title for worksheet in spreadsheet.worksheets()]
+        logger.info(
+            "Google Sheets startup check passed: spreadsheet='%s', worksheets=%s",
+            spreadsheet.title,
+            worksheet_titles,
+        )
+    except Exception as exc:
+        logger.warning("Google Sheets startup check failed: %s", exc)
+
+
+log_google_sheets_status()
+
+
 def create_default_state() -> Dict[str, Any]:
     return {
         "greeted": False,

@@ -1665,6 +1665,40 @@ def healthcheck() -> Tuple[Any, int]:
     return jsonify({"status": "ok", "service": "Agnikara Restaurant AI"}), 200
 
 
+@app.get("/debug/sheets")
+def debug_sheets() -> Tuple[Any, int]:
+    token = request.args.get("token", "")
+    if not VERIFY_TOKEN or token != VERIFY_TOKEN:
+        return jsonify({"status": "forbidden"}), 403
+
+    client = get_google_sheets_client()
+    result: Dict[str, Any] = {
+        "spreadsheet_id_configured": bool(GOOGLE_SHEETS_SPREADSHEET_ID),
+        "service_account_json_configured": bool(GOOGLE_SERVICE_ACCOUNT_JSON.strip()),
+        "service_account_file": str(GOOGLE_SERVICE_ACCOUNT_FILE),
+        "service_account_file_exists": GOOGLE_SERVICE_ACCOUNT_FILE.exists(),
+        "client_available": client is not None,
+    }
+
+    if not GOOGLE_SHEETS_SPREADSHEET_ID:
+        return jsonify(result), 200
+
+    if not client:
+        result["status"] = "client_unavailable"
+        return jsonify(result), 200
+
+    try:
+        spreadsheet = client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
+        result["status"] = "ok"
+        result["spreadsheet_title"] = spreadsheet.title
+        result["worksheets"] = [worksheet.title for worksheet in spreadsheet.worksheets()]
+        return jsonify(result), 200
+    except Exception as exc:
+        result["status"] = "access_failed"
+        result["error"] = str(exc)
+        return jsonify(result), 200
+
+
 @app.get("/webhook")
 def verify_webhook() -> Tuple[str, int]:
     mode = request.args.get("hub.mode")

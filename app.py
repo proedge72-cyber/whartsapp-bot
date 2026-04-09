@@ -1484,6 +1484,49 @@ def detect_explicit_language_preference(message: str) -> Optional[str]:
                 return language
             if lowered in keywords:
                 return language
+            short_tokens = [token for token in re.split(r"[^a-z]+", lowered) if token]
+            filler_tokens = {
+                "bro", "bhai", "bhaiya", "yaar", "pls", "please", "plz", "boss", "mate",
+                "man", "dude", "ok", "okay", "only", "just", "in", "me", "mein", "main",
+            }
+            meaningful_tokens = [token for token in short_tokens if token not in filler_tokens]
+            if meaningful_tokens and all(token in keywords for token in meaningful_tokens):
+                return language
+            if len(short_tokens) <= 4:
+                return language
+
+    if not openai_client:
+        return None
+
+    compact_message = " ".join(lowered.split())
+    if not compact_message or len(compact_message) > 80:
+        return None
+
+    try:
+        response = openai_client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Classify whether the user's message is asking the assistant to reply in a specific language. "
+                        "Return only valid JSON with schema "
+                        '{"language":"en|it|hi|hinglish|none","is_language_switch":true|false}. '
+                        "Treat casual phrases like 'english bro', 'hindi yaar', 'hinglish pls', "
+                        "'italiano please', or 'reply english' as language-switch requests. "
+                        "Do not mark ordinary food or reservation requests as language-switch requests."
+                    ),
+                },
+                {"role": "user", "content": message},
+            ],
+            max_output_tokens=60,
+        )
+        parsed = json_from_text(response.output_text) or {}
+        language = str(parsed.get("language", "none")).strip().lower()
+        if parsed.get("is_language_switch") and language in {"en", "it", "hi", "hinglish"}:
+            return language
+    except Exception as exc:
+        logger.warning("AI language-switch detection failed: %s", exc)
     return None
 
 

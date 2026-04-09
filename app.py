@@ -1537,6 +1537,27 @@ def resolve_reply_language(explicit_language: Optional[str], detected_input_lang
     return selected
 
 
+def is_language_neutral_message(message: str) -> bool:
+    sample = normalize_text(message)
+    if not sample:
+        return True
+
+    lowered = sample.lower()
+    if re.fullmatch(r"[\d\s]+", sample):
+        return True
+    if extract_order_token(sample):
+        return True
+    if "http://" in lowered or "https://" in lowered or "agnikara.netlify.app" in lowered:
+        return True
+    if lowered.startswith("your order token id:"):
+        return True
+    if parse_order_message(sample):
+        return True
+    if detect_validatable_order_message(sample):
+        return True
+    return False
+
+
 def localize_reply_text(reply: str, state: Dict[str, Any]) -> str:
     language = str(state.get("preferred_language", "en") or "en")
     if not reply.strip():
@@ -4099,8 +4120,14 @@ def build_reply(user_id: str, text: str) -> str:
     explicit_language = detect_explicit_language_preference(text)
     detected_input_language = detect_user_language(text, state)
     state["detected_input_language"] = detected_input_language
-    state["preferred_language"] = resolve_reply_language(explicit_language, detected_input_language)
-    state["language_locked"] = False
+    if explicit_language:
+        state["preferred_language"] = resolve_reply_language(explicit_language, detected_input_language)
+        state["language_locked"] = True
+    elif is_language_neutral_message(text):
+        state["preferred_language"] = str(state.get("preferred_language", "en") or "en")
+    else:
+        state["preferred_language"] = resolve_reply_language(None, detected_input_language)
+        state["language_locked"] = False
     refresh_order_stage(state)
     if state.get("sync_pending"):
         schedule_pending_sheet_sync(user_id)

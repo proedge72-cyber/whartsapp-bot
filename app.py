@@ -1562,6 +1562,8 @@ def localize_reply_text(reply: str, state: Dict[str, Any]) -> str:
     language = str(state.get("preferred_language", "en") or "en")
     if not reply.strip():
         return reply
+    if language == "en":
+        return reply
     if not openai_client:
         return reply
 

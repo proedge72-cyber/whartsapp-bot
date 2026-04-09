@@ -730,6 +730,7 @@ def create_default_state() -> Dict[str, Any]:
         "last_successful_step": "",
         "preferred_language": "en",
         "last_ai_action": "",
+        "last_assistant_reply": "",
         "pending_suggested_item": "",
         "recent_suggestions": [],
         "response_counters": {},
@@ -840,6 +841,8 @@ def get_state(user_id: str) -> Dict[str, Any]:
         state["last_successful_step"] = ""
     if "preferred_language" not in state:
         state["preferred_language"] = "en"
+    if "last_assistant_reply" not in state:
+        state["last_assistant_reply"] = ""
     profile = state.setdefault("customer_profile", {})
     profile.setdefault("insights", {})
     profile["insights"].setdefault("favorite_items", [])

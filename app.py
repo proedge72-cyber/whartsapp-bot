@@ -729,6 +729,8 @@ def create_default_state() -> Dict[str, Any]:
         "pending_sheet_sync": None,
         "last_successful_step": "",
         "preferred_language": "en",
+        "detected_input_language": "en",
+        "language_locked": False,
         "last_ai_action": "",
         "last_assistant_reply": "",
         "pending_suggested_item": "",
@@ -841,6 +843,10 @@ def get_state(user_id: str) -> Dict[str, Any]:
         state["last_successful_step"] = ""
     if "preferred_language" not in state:
         state["preferred_language"] = "en"
+    if "detected_input_language" not in state:
+        state["detected_input_language"] = state.get("preferred_language", "en")
+    if "language_locked" not in state:
+        state["language_locked"] = False
     if "last_assistant_reply" not in state:
         state["last_assistant_reply"] = ""
     profile = state.setdefault("customer_profile", {})
@@ -1449,23 +1455,65 @@ def detect_user_language(text: str, state: Optional[Dict[str, Any]] = None) -> s
     return str((state or {}).get("preferred_language", "en") or "en")
 
 
+def detect_explicit_language_preference(message: str) -> Optional[str]:
+    explicit_language = extract_language_switch(message)
+    if explicit_language:
+        return explicit_language
+
+    lowered = normalize_text(message).lower()
+    language_keywords = {
+        "en": ("english",),
+        "it": ("italian", "italiano"),
+        "hi": ("hindi",),
+        "hinglish": ("hinglish", "roman hindi"),
+    }
+    switch_phrases = (
+        "talk in",
+        "speak in",
+        "reply in",
+        "respond in",
+        "write in",
+        "answer in",
+        "continue in",
+        "use",
+        "from now",
+    )
+    for language, keywords in language_keywords.items():
+        if any(keyword in lowered for keyword in keywords):
+            if any(phrase in lowered for phrase in switch_phrases):
+                return language
+            if lowered in keywords:
+                return language
+    return None
+
+
+def resolve_reply_language(explicit_language: Optional[str], detected_input_language: str) -> str:
+    selected = explicit_language or detected_input_language or "en"
+    if selected == "hi":
+        return "hinglish"
+    return selected
+
+
 def localize_reply_text(reply: str, state: Dict[str, Any]) -> str:
     language = str(state.get("preferred_language", "en") or "en")
-    if language == "en" or not reply.strip():
+    if not reply.strip():
         return reply
     if not openai_client:
         return reply
 
     target_label = {
+        "en": "English",
         "it": "Italian",
-        "hi": "Hindi written in Devanagari script",
         "hinglish": "Hinglish written in natural Roman Hindi",
+        "hi": "Hinglish written in simple, natural Roman Hindi",
     }.get(language, "English")
 
     system_prompt = (
-        "Translate the assistant reply into the target language while preserving the structure, numbering, "
+        "Rewrite or translate the assistant reply into the target language while preserving the meaning, structure, numbering, "
         "menu URLs, order IDs, order tokens, phone numbers, prices, and line breaks exactly when possible. "
         "Do not translate IDs, URLs, tokens, or numeric values. Keep the tone warm and service-oriented. "
+        "Always produce the final answer fully in the target language, even if the source text is in another language. "
+        "If the target language is Hinglish or Hindi, use simple natural Hinglish in Roman script, avoid difficult Hindi words, and do not use Devanagari script. "
         "Return only the translated reply."
     )
     try:
@@ -1483,6 +1531,13 @@ def localize_reply_text(reply: str, state: Dict[str, Any]) -> str:
     except Exception as exc:
         logger.warning("Reply localization failed: %s", exc)
         return reply
+
+
+def finalize_reply(user_id: str, state: Dict[str, Any], reply: str) -> str:
+    localized_reply = localize_reply_text(reply, state)
+    state["last_assistant_reply"] = localized_reply
+    save_state(user_id, state)
+    return localized_reply
 
 
 def language_switch_confirmation(language: str) -> str:
@@ -3444,6 +3499,7 @@ def ai_decide_action(user_message: str, state: Dict[str, Any]) -> Dict[str, Any]
     if not openai_client:
         return {"action": "none", "intent": "none"}
     user_language = detect_user_language(user_message, state)
+    reply_language = str(state.get("preferred_language", user_language) or user_language)
     system_prompt = (
         "You are Agnikara Restaurant AI. Return only valid JSON. "
         "Choose one action from this set: "
@@ -3451,6 +3507,7 @@ def ai_decide_action(user_message: str, state: Dict[str, Any]) -> Dict[str, Any]
         + ". Keep replies under 60 words. Never show the full menu in chat. "
         f"If menu is relevant, use this link: {MENU_URL}. "
         "The user may write in English, Italian, Hindi, or Hinglish, and you must understand their intent correctly. "
+        "Always write the reply field in the required reply language from the system message, even if the user's message is in a different language. "
         "Never claim payment is received unless the action is check_payment_status. "
         'Schema: {"intent":"string","action":"string","reply":"string","item_name":"string","quantity":0,"needs_handoff":false}.'
     )
@@ -3461,6 +3518,7 @@ def ai_decide_action(user_message: str, state: Dict[str, Any]) -> Dict[str, Any]
                 {"role": "system", "content": system_prompt},
                 {"role": "system", "content": f"State: {json.dumps(serialize_state(state))}"},
                 {"role": "system", "content": f"Detected user language: {user_language}"},
+                {"role": "system", "content": f"Required reply language: {reply_language}"},
                 {"role": "user", "content": user_message},
             ],
             max_output_tokens=180,
@@ -3995,16 +4053,22 @@ def handle_rule_intent(user_id: str, state: Dict[str, Any], intent: str, text: s
 def build_reply(user_id: str, text: str) -> str:
     state = get_state(user_id)
     state["last_message_at"] = utc_now()
-    explicit_language = extract_language_switch(text)
-    if explicit_language:
-        state["preferred_language"] = explicit_language
-    else:
-        state["preferred_language"] = detect_user_language(text, state)
+    explicit_language = detect_explicit_language_preference(text)
+    detected_input_language = detect_user_language(text, state)
+    state["detected_input_language"] = detected_input_language
+    state["preferred_language"] = resolve_reply_language(explicit_language, detected_input_language)
+    state["language_locked"] = False
     refresh_order_stage(state)
     if state.get("sync_pending"):
         schedule_pending_sheet_sync(user_id)
 
     if explicit_language:
+        previous_reply = normalize_text(state.get("last_assistant_reply", ""))
+        if previous_reply:
+            save_state(user_id, state)
+            return localize_reply_text(previous_reply, state)
+        save_state(user_id, state)
+        return localize_reply_text(greeting_message_for_state(state), state)
         acknowledgements = {
             "en": "Sure, I'll continue in English.",
             "it": "Certo, continuero in italiano.",
@@ -4253,6 +4317,9 @@ def receive_webhook() -> Tuple[str, int]:
 
     try:
         reply = build_reply(sender, text)
+        state = get_state(sender)
+        state["last_assistant_reply"] = reply
+        save_state(sender, state)
         max_words = 220 if "Order ID:" in reply or "Total Amount:" in reply or "Total:" in reply else 80
         send_whatsapp_message(sender, reply, max_words=max_words)
         append_sheet_log(sender, get_state(sender), "message_handled")

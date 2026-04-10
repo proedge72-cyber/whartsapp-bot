@@ -1455,14 +1455,57 @@ def detect_user_language(text: str, state: Optional[Dict[str, Any]] = None) -> s
     return str((state or {}).get("preferred_language", "en") or "en")
 
 
+def ai_detect_language_preference(message: str) -> Optional[str]:
+    if not openai_client:
+        return None
+
+    compact_message = " ".join(normalize_text(message).split())
+    if not compact_message or len(compact_message) > 80:
+        return None
+
+    try:
+        response = openai_client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are the language-control brain for a WhatsApp restaurant assistant. "
+                        "Decide if the user's message is asking the assistant to change or restate the reply language. "
+                        "Return only valid JSON with schema "
+                        '{"language":"en|it|hi|hinglish|none","is_language_switch":true|false}. '
+                        "Use natural judgment, not fixed keywords. Treat casual phrases like 'english bro', "
+                        "'hindi yaar', 'hinglish pls', 'italiano please', 'reply english', 'no english', "
+                        "'I said English', 'talk in englih', or 'angrezi me' as language-switch requests. "
+                        "Map Hindi requests to language='hi'. Do not mark ordinary food, order, payment, menu, "
+                        "reservation, or support requests as language-switch requests unless the main intent is language control."
+                    ),
+                },
+                {"role": "user", "content": message},
+            ],
+            max_output_tokens=60,
+        )
+        parsed = json_from_text(response.output_text) or {}
+        language = str(parsed.get("language", "none")).strip().lower()
+        if parsed.get("is_language_switch") and language in {"en", "it", "hi", "hinglish"}:
+            return language
+    except Exception as exc:
+        logger.warning("AI language-switch detection failed: %s", exc)
+    return None
+
+
 def detect_explicit_language_preference(message: str) -> Optional[str]:
     explicit_language = extract_language_switch(message)
     if explicit_language:
         return explicit_language
 
+    ai_language = ai_detect_language_preference(message)
+    if ai_language:
+        return ai_language
+
     lowered = normalize_text(message).lower()
     language_keywords = {
-        "en": ("english",),
+        "en": ("english", "englih", "englsh", "angrezi"),
         "it": ("italian", "italiano"),
         "hi": ("hindi",),
         "hinglish": ("hinglish", "roman hindi"),
@@ -1494,39 +1537,6 @@ def detect_explicit_language_preference(message: str) -> Optional[str]:
                 return language
             if len(short_tokens) <= 4:
                 return language
-
-    if not openai_client:
-        return None
-
-    compact_message = " ".join(lowered.split())
-    if not compact_message or len(compact_message) > 80:
-        return None
-
-    try:
-        response = openai_client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Classify whether the user's message is asking the assistant to reply in a specific language. "
-                        "Return only valid JSON with schema "
-                        '{"language":"en|it|hi|hinglish|none","is_language_switch":true|false}. '
-                        "Treat casual phrases like 'english bro', 'hindi yaar', 'hinglish pls', "
-                        "'italiano please', or 'reply english' as language-switch requests. "
-                        "Do not mark ordinary food or reservation requests as language-switch requests."
-                    ),
-                },
-                {"role": "user", "content": message},
-            ],
-            max_output_tokens=60,
-        )
-        parsed = json_from_text(response.output_text) or {}
-        language = str(parsed.get("language", "none")).strip().lower()
-        if parsed.get("is_language_switch") and language in {"en", "it", "hi", "hinglish"}:
-            return language
-    except Exception as exc:
-        logger.warning("AI language-switch detection failed: %s", exc)
     return None
 
 
@@ -1558,11 +1568,11 @@ def is_language_neutral_message(message: str) -> bool:
     return False
 
 
-def localize_reply_text(reply: str, state: Dict[str, Any]) -> str:
+def localize_reply_text(reply: str, state: Dict[str, Any], force: bool = False) -> str:
     language = str(state.get("preferred_language", "en") or "en")
     if not reply.strip():
         return reply
-    if language == "en":
+    if language == "en" and not force:
         return reply
     if not openai_client:
         return reply
@@ -4125,11 +4135,8 @@ def build_reply(user_id: str, text: str) -> str:
     if explicit_language:
         state["preferred_language"] = resolve_reply_language(explicit_language, detected_input_language)
         state["language_locked"] = True
-    elif is_language_neutral_message(text):
-        state["preferred_language"] = str(state.get("preferred_language", "en") or "en")
     else:
-        state["preferred_language"] = resolve_reply_language(None, detected_input_language)
-        state["language_locked"] = False
+        state["preferred_language"] = str(state.get("preferred_language", "en") or "en")
     refresh_order_stage(state)
     if state.get("sync_pending"):
         schedule_pending_sheet_sync(user_id)
@@ -4137,10 +4144,14 @@ def build_reply(user_id: str, text: str) -> str:
     if explicit_language:
         previous_reply = normalize_text(state.get("last_assistant_reply", ""))
         if previous_reply:
+            translated_reply = localize_reply_text(previous_reply, state, force=True)
+            state["last_assistant_reply"] = translated_reply
             save_state(user_id, state)
-            return localize_reply_text(previous_reply, state)
+            return translated_reply
+        translated_reply = localize_reply_text(greeting_message_for_state(state), state, force=True)
+        state["last_assistant_reply"] = translated_reply
         save_state(user_id, state)
-        return localize_reply_text(greeting_message_for_state(state), state)
+        return translated_reply
         acknowledgements = {
             "en": "Sure, I'll continue in English.",
             "it": "Certo, continuero in italiano.",
